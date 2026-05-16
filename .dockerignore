@@ -1,0 +1,37 @@
+# --- Windows venv polluting skylogic/ source tree ---
+skylogic/Include/
+skylogic/Lib/
+skylogic/Scripts/
+skylogic/share/
+skylogic/pyvenv.cfg
+
+# --- Other venvs ---
+.venv/
+venv/
+*-venv/
+
+# --- Caches ---
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Heavy data not needed in image (mounted at runtime) ---
+data/raw/
+data/patches/
+data/yolo/
+models/sam/
+models/yolo/
+models/segformer/
+runs/
+
+# --- VCS / IDE ---
+.git/
+.vscode/
+.idea/
+
+# --- Misc ---
+*.log
+*.db
+.env

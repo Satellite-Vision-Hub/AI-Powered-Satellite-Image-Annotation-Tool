@@ -1,0 +1,68 @@
+# ============================================================
+# SkyLogic MAS — Multi-Agent Satellite Disaster Intelligence
+# Requirements File (CPU-Only Build)
+# ============================================================
+
+# --- Backend Framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# --- ORM & Database ---
+sqlalchemy==2.0.36
+geoalchemy2==0.16.0
+psycopg2-binary==2.9.10
+alembic==1.14.1
+
+# --- Authentication ---
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+# passlib 1.7.4 is incompatible with bcrypt>=4.1 (raises 72-byte ValueError at startup).
+# Pin to the last compatible release.
+bcrypt<4.1
+
+# --- Geo-Processing ---
+rasterio==1.4.3
+shapely==2.0.6
+fiona==1.10.1
+pyproj==3.7.0
+
+# --- AI Core: PyTorch (CPU-only) ---
+# Using CPU-only builds for AMD Ryzen 5 4500U system
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+torchvision>=0.17.0
+
+# --- AI: Object Detection (YOLOv10) ---
+ultralytics>=8.3.0
+
+# --- AI: Segmentation (SegFormer / U-Net) ---
+transformers>=4.47.0
+segmentation-models-pytorch>=0.3.4
+
+# --- AI: Segment Anything Model (SAM ViT-H) ---
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# --- AI: Ensemble Fusion (WBF) ---
+ensemble-boxes>=1.0.9
+
+# --- Vector Store ---
+qdrant-client>=1.12.0
+
+# --- Image Processing & Utilities ---
+numpy>=1.26.0
+pandas>=2.2.0
+Pillow>=10.4.0
+opencv-python-headless>=4.10.0
+tqdm>=4.67.0
+
+# --- Configuration ---
+python-dotenv>=1.0.1
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+
+# --- Geospatial Utilities ---
+geopandas>=1.0.1
+
+# --- CORS ---
+aiofiles>=24.1.0

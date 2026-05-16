@@ -1,0 +1,146 @@
+# ============================================================
+# SkyLogic MAS — .gitignore
+# ============================================================
+
+# ---------- SECRETS (never commit these) ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials.json
+service-account*.json
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing & linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ---------- Virtual environments ----------
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# In-tree virtualenv (skylogic/ has source + venv mixed)
+skylogic/Include/
+skylogic/Lib/
+skylogic/Scripts/
+skylogic/share/
+skylogic/pyvenv.cfg
+
+# ---------- Jupyter / Colab ----------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.jupyter/
+
+# ---------- Datasets (xView, patches, YOLO splits, segmentor) ----------
+data/raw/
+data/patches/
+data/yolo/
+data/segmentor/
+data/qdrant/
+data/metadata/
+data/cache/
+data/test/
+data/processed/
+*.tif
+*.tiff
+*.geojson
+
+# ---------- Model weights & training artifacts ----------
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+*.ckpt
+*.h5
+yolov8n.pt
+yolov8*.pt
+sam_vit_*.pth
+
+# Training run outputs
+runs/
+results.csv
+*.cache
+
+# ---------- Databases ----------
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+skylogic.db
+
+# ---------- Logs & build artifacts ----------
+*.log
+logs/
+*.tmp
+*.temp
+*.bak
+nohup.out
+
+# ---------- Editors & OS ----------
+.vscode/
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Local zip / archive bundles ----------
+skylogic_code.zip
+*.zip
+!docs/*.zip
+
+# ---------- Docker / container runtime ----------
+.docker/
+
+# ---------- Misc large outputs ----------
+*.mp4
+*.mov
+*.avi
