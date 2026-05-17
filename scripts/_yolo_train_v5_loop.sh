@@ -28,8 +28,19 @@ while [ $ITER -lt $MAX_ITERS ]; do
   # Stop any running container (safety)
   docker rm -f skylogic-trainer-yolo 2>/dev/null || true
 
-  # Decide: fresh start (using v4 best.pt as init weights) or resume from v5/last.pt
-  if [ ! -f "$LAST" ]; then
+  # Find the latest TRULY RESUMABLE checkpoint (epoch_N.pt with optimizer state).
+  # IMPORTANT: best.pt and last.pt have epoch=-1 (Ultralytics "stripped" format) and
+  # are NOT resumable — using them causes Ultralytics to silently fall back to
+  # defaults (coco8.yaml, batch=16, mosaic=1.0) and create garbage train-N/ runs.
+  LATEST_N=$(ls "${RUN_DIR}/weights/epoch"*.pt 2>/dev/null \
+             | sed 's|.*/epoch||; s|\.pt$||' \
+             | sort -n | tail -1)
+
+  if [ -n "$LATEST_N" ]; then
+    LATEST_CKPT="${RUN_DIR}/weights/epoch${LATEST_N}.pt"
+    echo "  Resume from epoch${LATEST_N}.pt ($(stat -c %y "$LATEST_CKPT" | cut -d. -f1))" | tee -a "$LOG"
+    EXTRA_ARGS=( --resume "/app/models/yolo/xview_v5/weights/epoch${LATEST_N}.pt" )
+  else
     echo "  Fresh start — init from v4/best.pt + native 512 + stronger aug" | tee -a "$LOG"
     EXTRA_ARGS=( \
       --project-root /app \
@@ -44,9 +55,6 @@ while [ $ITER -lt $MAX_ITERS ]; do
       --patience 15 --save-period 1 \
       --project /app/models/yolo --name xview_v5 \
     )
-  else
-    echo "  Resume from v5/last.pt ($(stat -c %y "$LAST" | cut -d. -f1))" | tee -a "$LOG"
-    EXTRA_ARGS=( --resume /app/models/yolo/xview_v5/weights/last.pt )
   fi
 
   docker run -d \
