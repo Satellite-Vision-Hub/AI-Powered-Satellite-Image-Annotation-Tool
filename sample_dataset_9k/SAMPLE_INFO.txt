@@ -1,0 +1,21 @@
+SAMPLE DATASET 9K - build summary
+========================================
+Total images : 9085
+  train      : 7268
+  val        : 908
+  test       : 909
+YOLO classes : 62 (62 present in sample)
+Annotations  : 369004
+Seg classes  : 10
+
+8 rarest classes (count, name):
+      5  Railway Vehicle
+     22  Reach Stacker
+     23  Straddle Carrier
+     38  class_82
+     48  Helicopter
+     54  Flat Car
+     54  class_75
+     60  Tower
+
+Original dataset was NOT modified - copy-only build.

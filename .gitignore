@@ -85,6 +85,13 @@ data/processed/
 *.tiff
 *.geojson
 
+# ---------- Sample experiment dataset (sample_dataset_9k) ----------
+# Keep the config/metadata files + README (tracked); exclude the bulk
+# image & label files and the upload zip (regenerable via scripts/).
+sample_dataset_9k/images/
+sample_dataset_9k/labels/
+sample_dataset_9k.zip
+
 # ---------- Model weights & training artifacts ----------
 models/
 *.pt
