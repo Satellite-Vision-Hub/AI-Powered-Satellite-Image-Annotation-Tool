@@ -85,7 +85,7 @@ import os, logging, sys
 from pathlib import Path
 
 # ---- Drive inputs / outputs (EDIT THESE) ----------------------------
-DRIVE_DATASET_SOURCE = '/content/drive/MyDrive/skylogic_full.zip'   # zip OR folder
+DRIVE_DATASET_SOURCE = '/content/drive/MyDrive/data'   # SkyLogic data folder on Drive (zip or folder)
 DRIVE_PROJECT_DIR    = '/content/drive/MyDrive/SkyLogic_sample9k_experiment'
 
 # ---- Sampling --------------------------------------------------------
@@ -179,11 +179,21 @@ def stage_source():
 SOURCE_ROOT = stage_source()
 log.info(f'SOURCE_ROOT = {SOURCE_ROOT}')""")
 
-code("""# 3.2 - Auto-detect YOLO layout in the source + locate class names.
-import yaml
+code("""# 3.2 - Auto-detect YOLO layout in the source + (if needed) synthesise YOLO
+#       labels from metadata CSVs. Also locates class names + sparse->contig map.
+import yaml, ast
 
 def detect_layout(root):
-    \"\"\"Return {split: (image_dir, label_dir)} by probing common patterns.\"\"\"
+    \"\"\"Return {split: (image_dir, label_dir)} by probing common patterns.
+
+    Handles, in order:
+      1. Pre-built YOLO sample:      images/{split}/      + labels/{split}/
+      2. Repacked sample folder:     sample_dataset_9k/images/{split}/ + .../labels/{split}/
+      3. Standard variant:           {split}/images/      + {split}/labels/
+      4. SkyLogic project repo root: data/patches/{split} + data/yolo/labels/{split}
+      5. data/yolo images variant:   data/yolo/images/{split} + data/yolo/labels/{split}
+      6. SkyLogic data/ as root:     patches/{split}      + yolo/labels/{split}
+    \"\"\"
     splits = {}
     for split in ('train', 'val', 'test'):
         candidates = [
@@ -192,6 +202,7 @@ def detect_layout(root):
             (root / split / 'images',                           root / split / 'labels'),
             (root / 'data' / 'patches' / split,                 root / 'data' / 'yolo' / 'labels' / split),
             (root / 'data' / 'yolo' / 'images' / split,         root / 'data' / 'yolo' / 'labels' / split),
+            (root / 'patches' / split,                          root / 'yolo' / 'labels' / split),
         ]
         for img_dir, lbl_dir in candidates:
             if img_dir.is_dir() and lbl_dir.is_dir():
@@ -208,7 +219,6 @@ def detect_layout(root):
     return splits
 
 def find_names(root):
-    \"\"\"Search for class names list in common YAML locations.\"\"\"
     candidates = [
         root / 'data.yaml', root / 'skylogic.yaml',
         root / 'data' / 'yolo' / 'skylogic.yaml',
@@ -220,14 +230,13 @@ def find_names(root):
             try:
                 cfg = yaml.safe_load(c.read_text())
                 n = cfg.get('names')
-                if isinstance(n, dict):  return [n[i] for i in sorted(n.keys())]
-                if isinstance(n, list):  return n
+                if isinstance(n, dict): return [n[i] for i in sorted(n.keys())]
+                if isinstance(n, list): return n
             except Exception as e:
                 log.warning(f'  could not parse {c}: {e}')
     return None
 
 def find_class_map(root):
-    \"\"\"Optional class_map.json (sparse->contiguous) - copied along if found.\"\"\"
     for c in [root / 'class_map.json',
               root / 'data' / 'yolo' / 'class_map.json',
               root / 'sample_dataset_9k' / 'class_map.json']:
@@ -236,17 +245,188 @@ def find_class_map(root):
             except Exception: pass
     return None
 
+def synthesize_yolo_labels_from_metadata(root):
+    \"\"\"Build YOLO labels from data/metadata/{annotations,patches}_metadata.csv.
+
+    Looks for the CSVs in two locations:
+      - root/metadata/...      (when SOURCE_ROOT points at the data/ folder)
+      - root/data/metadata/... (when SOURCE_ROOT points at the project repo root)
+
+    Returns (synth_dir, sparse_to_contig, names_list, patches_root) or
+    (None, None, None, None) if metadata files are missing.
+
+    Output structure: /content/_synth_labels/{train,val,test}/*.txt
+    The patches images are referenced in-place; only labels are written.
+    \"\"\"
+    import pandas as pd
+    candidates = [
+        (root / 'metadata',         root / 'patches'),
+        (root / 'data' / 'metadata',root / 'data' / 'patches'),
+    ]
+    meta_dir = patches_root = None
+    for m, p in candidates:
+        if (m / 'annotations_metadata.csv').exists() \\
+                and (m / 'patches_metadata.csv').exists() \\
+                and p.is_dir():
+            meta_dir = m; patches_root = p; break
+    if meta_dir is None:
+        return None, None, None, None
+
+    log.info(f'No precomputed YOLO labels - synthesising from {meta_dir}/...')
+    out_dir = Path('/content/_synth_labels')
+    marker  = out_dir / '.synthesised'
+
+    log.info('  reading annotations_metadata.csv ...')
+    ann = pd.read_csv(meta_dir / 'annotations_metadata.csv')
+    log.info('  reading patches_metadata.csv ...')
+    p   = pd.read_csv(meta_dir / 'patches_metadata.csv')
+
+    # Sparse class id -> contiguous + class names list (preserve sparse order).
+    id_name = ann[['class_id','class_name']].drop_duplicates('class_id') \\
+                  .sort_values('class_id')
+    sparse_ids = [int(c) for c in id_name['class_id']]
+    sparse_to_contig = {sid: i for i, sid in enumerate(sparse_ids)}
+    names_list = [str(n) for n in id_name['class_name'].tolist()]
+    log.info(f'  {len(names_list)} classes derived from CSV: '
+             f'sparse {min(sparse_ids)}..{max(sparse_ids)} -> contiguous 0..{len(names_list)-1}')
+
+    if marker.exists() and not FORCE_RESAMPLE:
+        log.info(f'  labels already synthesised at {out_dir} - reusing')
+        return out_dir, sparse_to_contig, names_list, patches_root
+
+    log.info(f'  writing synthesised labels under {out_dir} (one-time cost)')
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    for split in ('train', 'val', 'test'):
+        (out_dir / split).mkdir()
+
+    # Map patch_filename -> (W, H, split)
+    p_info = {}
+    for row in p.itertuples(index=False):
+        try:
+            p_info[str(row.filename)] = (int(row.width), int(row.height), str(row.split))
+        except Exception:
+            continue
+
+    written = {'train': 0, 'val': 0, 'test': 0}
+    no_meta = 0
+    n_grp = ann['patch_filename'].nunique()
+    log.info(f'  iterating {n_grp} unique patches with annotations ...')
+    for i, (pf, group) in enumerate(ann.groupby('patch_filename'), 1):
+        if pf not in p_info:
+            no_meta += 1; continue
+        W, H, split = p_info[pf]
+        if split not in ('train', 'val', 'test'):
+            split = 'train'
+        lines = []
+        for _, r in group.iterrows():
+            try:
+                bb = ast.literal_eval(str(r['bbox']))
+                if not (isinstance(bb, (list, tuple)) and len(bb) == 4):
+                    continue
+                x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+            except Exception:
+                continue
+            contig = sparse_to_contig.get(int(r['class_id']))
+            if contig is None: continue
+            cx = ((x1 + x2) / 2.0) / W
+            cy = ((y1 + y2) / 2.0) / H
+            bw = abs(x2 - x1) / W
+            bh = abs(y2 - y1) / H
+            if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0
+                    and 0.0 < bw <= 1.0 and 0.0 < bh <= 1.0):
+                continue
+            lines.append(f'{contig} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}')
+        if lines:
+            stem = Path(pf).stem
+            (out_dir / split / f'{stem}.txt').write_text('\\n'.join(lines) + '\\n')
+            written[split] += 1
+        if i % 5000 == 0:
+            log.info(f'    {i}/{n_grp} patches processed')
+    marker.touch()
+    log.info(f'  synthesised labels per split: {written}  '
+             f'(patches with no size-metadata: {no_meta})')
+    return out_dir, sparse_to_contig, names_list, patches_root
+
+# ---- Run detection ---------------------------------------------------
 source_splits = detect_layout(SOURCE_ROOT)
 names         = find_names(SOURCE_ROOT)
 class_map     = find_class_map(SOURCE_ROOT)
 
+# Fallback: if labels weren't found anywhere but metadata CSVs are present,
+# synthesise YOLO labels from them.
+if not source_splits:
+    synth_dir, synth_s2c, synth_names, patches_root = \\
+        synthesize_yolo_labels_from_metadata(SOURCE_ROOT)
+    if synth_dir is not None:
+        for split in ('train', 'val', 'test'):
+            img_dir = patches_root / split
+            lbl_dir = synth_dir / split
+            if img_dir.is_dir() and lbl_dir.is_dir() \\
+                    and next(img_dir.glob('*.png'), None):
+                source_splits[split] = (img_dir, lbl_dir)
+        if names is None:
+            names = synth_names
+        if class_map is None and synth_s2c:
+            class_map = {'sparse_to_contiguous': {str(k): v for k, v in synth_s2c.items()}}
+        log.info(f'After synthesis - splits: {list(source_splits)}')
+
 log.info(f'Detected splits: {list(source_splits)}')
 for s, (i, l) in source_splits.items():
     log.info(f'  {s}: images={i}  labels={l}')
-log.info(f'Class names file : {"found ("+str(len(names))+" classes)" if names else "not found - will infer"}')
+log.info(f'Class names file : '
+         f'{"found ("+str(len(names))+" classes)" if names else "not found - will infer"}')
 log.info(f'class_map.json   : {"found" if class_map else "not found"}')
 
-assert source_splits, 'No image/label layout detected in source. Check DRIVE_DATASET_SOURCE.'""")
+assert source_splits, ('No image/label layout detected in source - '
+                       'and no metadata CSVs found to synthesise labels from. '
+                       'Check DRIVE_DATASET_SOURCE.')""")
+
+# Debug cell - prints everything we know about source + detected layout.
+code("""# 3.3 - DEBUG: source state + detected layout (before sampling)
+print('=' * 78)
+print(' DEBUG: dataset source + detected layout')
+print('=' * 78)
+print(f'DRIVE_DATASET_SOURCE   = {DRIVE_DATASET_SOURCE}')
+print(f'exists                 = {os.path.exists(DRIVE_DATASET_SOURCE)}')
+print(f'SOURCE_ROOT (post-stg) = {SOURCE_ROOT}')
+print(f'SOURCE_ROOT exists     = {Path(SOURCE_ROOT).exists()}')
+print()
+print('Top-level entries inside SOURCE_ROOT:')
+try:
+    for item in sorted(Path(SOURCE_ROOT).iterdir()):
+        kind = 'D' if item.is_dir() else 'F'
+        sz = ''
+        if item.is_file():
+            try: sz = f'  ({item.stat().st_size:,} bytes)'
+            except Exception: pass
+        print(f'  [{kind}] {item.name}{sz}')
+except Exception as e:
+    print(f'  (could not list: {e})')
+
+print()
+print(f'Detected splits: {list(source_splits)}')
+total_imgs = total_lbls = 0
+for split, (img_dir, lbl_dir) in source_splits.items():
+    try:
+        n_img = sum(1 for p in img_dir.iterdir() if p.is_file())
+    except Exception: n_img = -1
+    try:
+        n_lbl = sum(1 for _ in lbl_dir.glob('*.txt'))
+    except Exception: n_lbl = -1
+    total_imgs += max(0, n_img); total_lbls += max(0, n_lbl)
+    print(f'  {split}:')
+    print(f'    images_dir = {img_dir}  ({n_img} files)')
+    print(f'    labels_dir = {lbl_dir}  ({n_lbl} files)')
+print(f'TOTAL images detected: {total_imgs}')
+print(f'TOTAL labels detected: {total_lbls}')
+print(f'Class names           : {len(names) if names else 0}')
+print(f'class_map.json present: {bool(class_map)}')
+print('=' * 78)
+log.info(f'DEBUG layout summary - splits={list(source_splits)} '
+         f'imgs={total_imgs} lbls={total_lbls} '
+         f'names={len(names) if names else 0}')""")
 
 code("""# 3.3 - Collect annotated stems per split + decide sampling mode.
 import random
