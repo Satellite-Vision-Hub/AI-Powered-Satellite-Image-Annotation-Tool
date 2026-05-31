@@ -3,12 +3,17 @@
 build_colab_notebook.py - Generate SkyLogic_Sample9k_Colab.ipynb.
 
 Produces a fully self-contained Colab notebook that:
-  1.  Mounts Drive
-  2.  Reads the ORIGINAL full dataset (zip or folder) from Drive
-  3.  Builds a copy-only ~9k sample inside Colab/Drive (original untouched)
-  4.  Verifies every label (format, class range, bbox normalisation)
-  5.  Trains YOLOv12 (resume-aware) + SegFormer (resume-aware)
-  6.  Saves everything to Drive and prints the final paths
+  1.  Mounts Drive and reads the ORIGINAL full dataset (read-only) from Drive
+  2.  Synthesises/validates YOLO labels and analyses the full class distribution
+  3.  MERGES the 62 fine-grained xView classes into broader, balanced semantic
+      groups and DROPS unknown/ambiguous classes (e.g. class_75, class_82)
+  4.  Builds a CLASS-BALANCED ~9,000-image dataset (under-samples majority
+      groups, drops too-rare groups) in a SEPARATE experiment folder on Drive
+  5.  Prints a FINAL TRAINING DATASET SUMMARY, then trains YOLOv12 (resume-aware)
+  6.  Reports REAL validation metrics only (never hardcodes accuracy)
+
+The original Drive dataset is treated as strictly read-only - every output is
+written into /content/drive/MyDrive/SkyLogic_balanced_yolov12_experiment.
 
 Re-run this generator any time to refresh the notebook.
 
@@ -39,24 +44,34 @@ def code(text: str) -> None:
 # ======================================================================
 # Title
 # ======================================================================
-md("""# SkyLogic - Sample-9k Colab Pipeline (YOLOv12 + SegFormer)
+md("""# SkyLogic - Balanced YOLOv12 Pipeline (class merging + balancing)
 
 **Self-contained for Google Colab T4 GPU.**
 
-This notebook reads the **original/full** SkyLogic dataset (zip or folder)
-from your Google Drive, builds a **copy-only ~9,000-image sample** while
-preserving class diversity, verifies every label, then trains YOLOv12
-detection + SegFormer segmentation. The original Drive dataset is **never
-modified**.
+This notebook reads the **original/full** SkyLogic dataset (folder or zip) from
+your Google Drive, then:
+
+1. Synthesises/validates YOLO labels and analyses the **full class distribution**.
+2. **Merges** the 62 fine-grained xView classes into broader, balanced semantic
+   groups (aircraft, small vehicle, truck/bus, rail, maritime, construction,
+   building/facility, storage tank, shipping container, infrastructure) and
+   **drops unknown/ambiguous classes** (e.g. `class_75`, `class_82`).
+3. Builds a **class-balanced ~9,000-image dataset** (under-samples the majority
+   groups, drops too-rare groups, remaps every label to the new group ids).
+4. Prints a **FINAL TRAINING DATASET SUMMARY**, then trains **YOLOv12** and
+   reports **real validation metrics only**.
+
+> **Safety:** the original Drive dataset is treated as **strictly read-only**.
+> Everything is written to a separate experiment folder on Drive.
 
 **To run:**
 1. `Runtime -> Change runtime type -> T4 GPU`.
-2. Edit `DRIVE_DATASET_SOURCE` in the **Config** cell (Section 2) to point at
-   your uploaded dataset (zip or folder).
+2. Edit `DRIVE_DATASET_SOURCE` in the **Config** cell (Section 2) if your data
+   is not at `/content/drive/MyDrive/data`.
 3. `Runtime -> Run all`.
 
-If Colab disconnects, just **Run all again** - both YOLOv12 and SegFormer
-auto-resume from their last checkpoint on Drive.""")
+If Colab disconnects, just **Run all again** - the balanced dataset is reused
+and YOLOv12 auto-resumes from its last checkpoint on Drive.""")
 
 # ======================================================================
 # 1 - Environment setup
@@ -72,58 +87,57 @@ assert torch.cuda.is_available(), \\
 print('Torch', torch.__version__, '| GPU:', torch.cuda.get_device_name(0))""")
 
 # ======================================================================
-# 2 - Drive mount and paths
+# 2 - Drive mount and config
 # ======================================================================
-md("## 2 - Drive mount and paths")
+md("## 2 - Drive mount and config")
 
 code("""# 2.1 - Mount Google Drive
 from google.colab import drive
 drive.mount('/content/drive')""")
 
-code("""# 2.2 - CONFIG: edit the Drive locations + sampling/training knobs below.
+code("""# 2.2 - CONFIG: edit the Drive locations + balancing/training knobs below.
 import os, logging, sys
 from pathlib import Path
 
-# ---- Drive inputs / outputs (EDIT THESE) ----------------------------
-DRIVE_DATASET_SOURCE = '/content/drive/MyDrive/data'   # SkyLogic data folder on Drive (zip or folder)
-DRIVE_PROJECT_DIR    = '/content/drive/MyDrive/SkyLogic_sample9k_experiment'
+# ---- Drive input (READ-ONLY) + outputs (EDIT IF NEEDED) -------------
+DRIVE_DATASET_SOURCE = '/content/drive/MyDrive/data'   # original SkyLogic data (folder or .zip)
+DRIVE_PROJECT_DIR    = '/content/drive/MyDrive/SkyLogic_balanced_yolov12_experiment'
+BALANCED_DIR         = f'{DRIVE_PROJECT_DIR}/balanced_dataset_9k'   # all outputs land here
 
-# ---- Sampling --------------------------------------------------------
-SAMPLE_SIZE     = 9000          # approximate target image count
-FORCE_RESAMPLE  = False         # set True to rebuild the Drive sample from scratch
+# ---- Class merging + balancing --------------------------------------
+TARGET_TOTAL    = 9000          # approximate balanced image target
+MIN_GROUP_IMAGES = 50           # drop a merged group rarer than this many images
+FORCE_RESAMPLE  = False         # True rebuilds the balanced dataset from scratch
 SAMPLE_SEED     = 42
-SPLIT_RATIOS    = (0.80, 0.10, 0.10)   # train, val, test (used if source has no usable splits)
+SPLIT_RATIOS    = (0.80, 0.10, 0.10)   # train/val/test when re-splitting
+# Balancing is image-level + rare-class-first with a per-group cap of
+# ceil(TARGET_TOTAL / num_groups). Detection data is multi-label, so a few
+# ubiquitous classes (buildings, cars) co-occur in most scenes and cannot be
+# made truly rare without discarding most images.
+#   True  -> after capping, top up to ~TARGET_TOTAL (keeps the most data; the
+#            cap still under-samples the majority groups first).
+#   False -> stop at the caps (a smaller, more strictly balanced dataset).
+BALANCE_FILL_TO_TARGET = True
 
 # ---- Verification gate ----------------------------------------------
-ALLOW_INVALID_LABELS = False    # set True to proceed despite verification errors
+ALLOW_INVALID_LABELS = False    # True proceeds even if verification finds errors
 
-# ---- YOLOv12 detection -----------------------------------------------
-YOLO_MODEL    = 'yolo12s.pt'    # lightweight; 'yolo12n.pt' = even faster on T4
-YOLO_EPOCHS   = 50
-YOLO_IMGSZ    = 512
+# ---- YOLOv12 detection (lightweight, tuned for T4) -------------------
+YOLO_MODEL    = 'yolo12s.pt'    # 'yolo12n.pt' = even faster/smaller on T4
+YOLO_EPOCHS   = 60              # early stopping (patience) usually stops sooner
+YOLO_IMGSZ    = 512            # patches are 512x512; 640 is an option (slower)
 YOLO_BATCH    = 16
 YOLO_PATIENCE = 15
-YOLO_RUN_NAME = 'sample9k'
-
-# ---- SegFormer segmentation -----------------------------------------
-SEG_BACKBONE      = 'nvidia/mit-b0'
-SEG_EPOCHS        = 20
-SEG_IMGSZ         = 512
-SEG_BATCH         = 8
-SEG_LR            = 6e-5
-SEG_VAL_EVERY     = 2            # validate every N epochs
-NUM_SEG_CLASSES   = 10
+YOLO_RUN_NAME = 'balanced9k'
 
 # ---- Derived paths --------------------------------------------------
-DRIVE_SAMPLE_DIR = f'{DRIVE_PROJECT_DIR}/sample_dataset_9k'   # canonical sample
-LOCAL_SOURCE_DIR = '/content/_source'                          # source extract
-LOCAL_SAMPLE_DIR = '/content/sample_dataset_9k'                # fast SSD mirror
-YOLO_PROJECT_DIR = f'{DRIVE_PROJECT_DIR}/yolov12'
-SEG_DIR          = f'{DRIVE_PROJECT_DIR}/segformer'
-RESULTS_DIR      = f'{DRIVE_PROJECT_DIR}/results'
-LOG_FILE         = f'{DRIVE_PROJECT_DIR}/run.log'
+LOCAL_SOURCE_DIR    = '/content/_source'              # zip extract cache
+LOCAL_BALANCED_DIR  = '/content/balanced_dataset_9k'  # fast SSD mirror for training
+YOLO_PROJECT_DIR    = f'{DRIVE_PROJECT_DIR}/yolov12'
+RESULTS_DIR         = f'{DRIVE_PROJECT_DIR}/results'
+LOG_FILE            = f'{DRIVE_PROJECT_DIR}/run.log'
 
-for d in (DRIVE_PROJECT_DIR, DRIVE_SAMPLE_DIR, YOLO_PROJECT_DIR, SEG_DIR, RESULTS_DIR):
+for d in (DRIVE_PROJECT_DIR, BALANCED_DIR, YOLO_PROJECT_DIR, RESULTS_DIR):
     os.makedirs(d, exist_ok=True)
 
 # Logging: tee everything to a Drive file so it survives disconnects.
@@ -133,20 +147,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s',
                     handlers=[logging.FileHandler(LOG_FILE),
                               logging.StreamHandler(sys.stdout)])
 log = logging.getLogger('skylogic')
-log.info('=== SkyLogic Sample-9k run started ===')
-log.info(f'DRIVE_DATASET_SOURCE = {DRIVE_DATASET_SOURCE}')
-log.info(f'DRIVE_PROJECT_DIR    = {DRIVE_PROJECT_DIR}')
-log.info(f'SAMPLE_SIZE = {SAMPLE_SIZE}  FORCE_RESAMPLE = {FORCE_RESAMPLE}')""")
+log.info('=== SkyLogic balanced-YOLOv12 run started ===')
+log.info(f'DRIVE_DATASET_SOURCE = {DRIVE_DATASET_SOURCE}  (READ-ONLY)')
+log.info(f'BALANCED_DIR         = {BALANCED_DIR}')
+log.info(f'TARGET_TOTAL = {TARGET_TOTAL}  MIN_GROUP_IMAGES = {MIN_GROUP_IMAGES}  '
+         f'FORCE_RESAMPLE = {FORCE_RESAMPLE}')""")
 
 # ======================================================================
-# 3 - Dataset extraction/sampling
+# 3 - Stage source + detect/synthesise YOLO labels
 # ======================================================================
-md("""## 3 - Dataset extraction/sampling
-- Source `.zip` is extracted to `/content/_source` once (cached).
-- Source folder is read directly (Drive FUSE) - only **sampled** files are copied.
-- The sample is built on Drive (persistent) **and** mirrored to local SSD (fast).
-- If a valid sample already exists on Drive and `FORCE_RESAMPLE = False`, it is
-  reused without recopying.""")
+md("""## 3 - Stage source + detect/synthesise YOLO labels
+- A source `.zip` is extracted once to `/content/_source` (cached); a source
+  folder is read **in place** from Drive (never modified).
+- The YOLO layout is auto-detected. If the dataset ships only metadata CSVs
+  (xView style), YOLO labels are **synthesised** from them under
+  `/content/_synth_labels` (the original Drive files are left untouched).""")
 
 code("""# 3.1 - Stage source: extract zip to local SSD, or locate the folder.
 import shutil, zipfile, time
@@ -179,40 +194,27 @@ def stage_source():
 SOURCE_ROOT = stage_source()
 log.info(f'SOURCE_ROOT = {SOURCE_ROOT}')""")
 
-code("""# 3.2 - Auto-detect YOLO layout in the source + (if needed) synthesise YOLO
-#       labels from metadata CSVs. Also locates class names + sparse->contig map.
+code("""# 3.2 - Auto-detect YOLO layout + (if needed) synthesise labels from metadata.
 import yaml, ast
 
 def detect_layout(root):
-    \"\"\"Return {split: (image_dir, label_dir)} by probing common patterns.
-
-    Handles, in order:
-      1. Pre-built YOLO sample:      images/{split}/      + labels/{split}/
-      2. Repacked sample folder:     sample_dataset_9k/images/{split}/ + .../labels/{split}/
-      3. Standard variant:           {split}/images/      + {split}/labels/
-      4. SkyLogic project repo root: data/patches/{split} + data/yolo/labels/{split}
-      5. data/yolo images variant:   data/yolo/images/{split} + data/yolo/labels/{split}
-      6. SkyLogic data/ as root:     patches/{split}      + yolo/labels/{split}
-    \"\"\"
+    \"\"\"Return {split: (image_dir, label_dir)} by probing common patterns.\"\"\"
     splits = {}
     for split in ('train', 'val', 'test'):
         candidates = [
-            (root / 'images' / split,                           root / 'labels' / split),
-            (root / 'sample_dataset_9k' / 'images' / split,     root / 'sample_dataset_9k' / 'labels' / split),
-            (root / split / 'images',                           root / split / 'labels'),
-            (root / 'data' / 'patches' / split,                 root / 'data' / 'yolo' / 'labels' / split),
-            (root / 'data' / 'yolo' / 'images' / split,         root / 'data' / 'yolo' / 'labels' / split),
-            (root / 'patches' / split,                          root / 'yolo' / 'labels' / split),
+            (root / 'images' / split,                       root / 'labels' / split),
+            (root / 'sample_dataset_9k' / 'images' / split, root / 'sample_dataset_9k' / 'labels' / split),
+            (root / split / 'images',                       root / split / 'labels'),
+            (root / 'data' / 'patches' / split,             root / 'data' / 'yolo' / 'labels' / split),
+            (root / 'data' / 'yolo' / 'images' / split,     root / 'data' / 'yolo' / 'labels' / split),
+            (root / 'patches' / split,                      root / 'yolo' / 'labels' / split),
         ]
         for img_dir, lbl_dir in candidates:
             if img_dir.is_dir() and lbl_dir.is_dir():
                 if next(img_dir.glob('*.png'), None) or next(img_dir.glob('*.jpg'), None):
                     splits[split] = (img_dir, lbl_dir); break
     if not splits:
-        for img_dir, lbl_dir in [
-            (root / 'images', root / 'labels'),
-            (root,            root),
-        ]:
+        for img_dir, lbl_dir in [(root / 'images', root / 'labels'), (root, root)]:
             if img_dir.is_dir() and lbl_dir.is_dir() and (
                 next(img_dir.glob('*.png'), None) or next(img_dir.glob('*.jpg'), None)):
                 splits['train'] = (img_dir, lbl_dir); break
@@ -246,28 +248,16 @@ def find_class_map(root):
     return None
 
 def synthesize_yolo_labels_from_metadata(root):
-    \"\"\"Build YOLO labels from data/metadata/{annotations,patches}_metadata.csv.
-
-    Looks for the CSVs in two locations:
-      - root/metadata/...      (when SOURCE_ROOT points at the data/ folder)
-      - root/data/metadata/... (when SOURCE_ROOT points at the project repo root)
-
-    Returns (synth_dir, sparse_to_contig, names_list, patches_root) or
-    (None, None, None, None) if metadata files are missing.
-
-    Output structure: /content/_synth_labels/{train,val,test}/*.txt
-    The patches images are referenced in-place; only labels are written.
-    \"\"\"
+    \"\"\"Build YOLO labels from data/metadata/{annotations,patches}_metadata.csv.\"\"\"
     import pandas as pd
     candidates = [
-        (root / 'metadata',         root / 'patches'),
-        (root / 'data' / 'metadata',root / 'data' / 'patches'),
+        (root / 'metadata',          root / 'patches'),
+        (root / 'data' / 'metadata', root / 'data' / 'patches'),
     ]
     meta_dir = patches_root = None
     for m, p in candidates:
         if (m / 'annotations_metadata.csv').exists() \\
-                and (m / 'patches_metadata.csv').exists() \\
-                and p.is_dir():
+                and (m / 'patches_metadata.csv').exists() and p.is_dir():
             meta_dir = m; patches_root = p; break
     if meta_dir is None:
         return None, None, None, None
@@ -281,14 +271,13 @@ def synthesize_yolo_labels_from_metadata(root):
     log.info('  reading patches_metadata.csv ...')
     p   = pd.read_csv(meta_dir / 'patches_metadata.csv')
 
-    # Sparse class id -> contiguous + class names list (preserve sparse order).
     id_name = ann[['class_id','class_name']].drop_duplicates('class_id') \\
                   .sort_values('class_id')
     sparse_ids = [int(c) for c in id_name['class_id']]
     sparse_to_contig = {sid: i for i, sid in enumerate(sparse_ids)}
     names_list = [str(n) for n in id_name['class_name'].tolist()]
     log.info(f'  {len(names_list)} classes derived from CSV: '
-             f'sparse {min(sparse_ids)}..{max(sparse_ids)} -> contiguous 0..{len(names_list)-1}')
+             f'sparse {min(sparse_ids)}..{max(sparse_ids)} -> 0..{len(names_list)-1}')
 
     if marker.exists() and not FORCE_RESAMPLE:
         log.info(f'  labels already synthesised at {out_dir} - reusing')
@@ -301,7 +290,6 @@ def synthesize_yolo_labels_from_metadata(root):
     for split in ('train', 'val', 'test'):
         (out_dir / split).mkdir()
 
-    # Map patch_filename -> (W, H, split)
     p_info = {}
     for row in p.itertuples(index=False):
         try:
@@ -345,8 +333,7 @@ def synthesize_yolo_labels_from_metadata(root):
         if i % 5000 == 0:
             log.info(f'    {i}/{n_grp} patches processed')
     marker.touch()
-    log.info(f'  synthesised labels per split: {written}  '
-             f'(patches with no size-metadata: {no_meta})')
+    log.info(f'  synthesised labels per split: {written}  (no size-metadata: {no_meta})')
     return out_dir, sparse_to_contig, names_list, patches_root
 
 # ---- Run detection ---------------------------------------------------
@@ -354,8 +341,6 @@ source_splits = detect_layout(SOURCE_ROOT)
 names         = find_names(SOURCE_ROOT)
 class_map     = find_class_map(SOURCE_ROOT)
 
-# Fallback: if labels weren't found anywhere but metadata CSVs are present,
-# synthesise YOLO labels from them.
 if not source_splits:
     synth_dir, synth_s2c, synth_names, patches_root = \\
         synthesize_yolo_labels_from_metadata(SOURCE_ROOT)
@@ -363,8 +348,7 @@ if not source_splits:
         for split in ('train', 'val', 'test'):
             img_dir = patches_root / split
             lbl_dir = synth_dir / split
-            if img_dir.is_dir() and lbl_dir.is_dir() \\
-                    and next(img_dir.glob('*.png'), None):
+            if img_dir.is_dir() and lbl_dir.is_dir() and next(img_dir.glob('*.png'), None):
                 source_splits[split] = (img_dir, lbl_dir)
         if names is None:
             names = synth_names
@@ -375,535 +359,693 @@ if not source_splits:
 log.info(f'Detected splits: {list(source_splits)}')
 for s, (i, l) in source_splits.items():
     log.info(f'  {s}: images={i}  labels={l}')
-log.info(f'Class names file : '
-         f'{"found ("+str(len(names))+" classes)" if names else "not found - will infer"}')
-log.info(f'class_map.json   : {"found" if class_map else "not found"}')
+log.info(f'Class names: {"found ("+str(len(names))+")" if names else "not found - will infer"}')
 
-assert source_splits, ('No image/label layout detected in source - '
-                       'and no metadata CSVs found to synthesise labels from. '
+assert source_splits, ('No image/label layout detected in source - and no '
+                       'metadata CSVs found to synthesise labels from. '
                        'Check DRIVE_DATASET_SOURCE.')""")
 
-# Debug cell - prints everything we know about source + detected layout.
-code("""# 3.3 - DEBUG: source state + detected layout (before sampling)
+code("""# 3.3 - DEBUG report: source state + detected layout (before any analysis).
 print('=' * 78)
 print(' DEBUG: dataset source + detected layout')
 print('=' * 78)
 print(f'DRIVE_DATASET_SOURCE   = {DRIVE_DATASET_SOURCE}')
 print(f'exists                 = {os.path.exists(DRIVE_DATASET_SOURCE)}')
-print(f'SOURCE_ROOT (post-stg) = {SOURCE_ROOT}')
-print(f'SOURCE_ROOT exists     = {Path(SOURCE_ROOT).exists()}')
+print(f'SOURCE_ROOT (staged)   = {SOURCE_ROOT}')
 print()
 print('Top-level entries inside SOURCE_ROOT:')
 try:
     for item in sorted(Path(SOURCE_ROOT).iterdir()):
         kind = 'D' if item.is_dir() else 'F'
-        sz = ''
-        if item.is_file():
-            try: sz = f'  ({item.stat().st_size:,} bytes)'
-            except Exception: pass
-        print(f'  [{kind}] {item.name}{sz}')
+        print(f'  [{kind}] {item.name}')
 except Exception as e:
     print(f'  (could not list: {e})')
-
 print()
 print(f'Detected splits: {list(source_splits)}')
-total_imgs = total_lbls = 0
+dbg_imgs = dbg_lbls = 0
 for split, (img_dir, lbl_dir) in source_splits.items():
-    try:
-        n_img = sum(1 for p in img_dir.iterdir() if p.is_file())
+    try: n_img = sum(1 for p in img_dir.iterdir() if p.is_file())
     except Exception: n_img = -1
-    try:
-        n_lbl = sum(1 for _ in lbl_dir.glob('*.txt'))
+    try: n_lbl = sum(1 for _ in lbl_dir.glob('*.txt'))
     except Exception: n_lbl = -1
-    total_imgs += max(0, n_img); total_lbls += max(0, n_lbl)
-    print(f'  {split}:')
-    print(f'    images_dir = {img_dir}  ({n_img} files)')
-    print(f'    labels_dir = {lbl_dir}  ({n_lbl} files)')
-print(f'TOTAL images detected: {total_imgs}')
-print(f'TOTAL labels detected: {total_lbls}')
-print(f'Class names           : {len(names) if names else 0}')
-print(f'class_map.json present: {bool(class_map)}')
+    dbg_imgs += max(0, n_img); dbg_lbls += max(0, n_lbl)
+    print(f'  {split}:  images_dir={img_dir} ({n_img})  labels_dir={lbl_dir} ({n_lbl})')
+print(f'TOTAL images detected : {dbg_imgs}')
+print(f'TOTAL labels detected : {dbg_lbls}')
+print(f'Raw class count       : {len(names) if names else 0}')
 print('=' * 78)
-log.info(f'DEBUG layout summary - splits={list(source_splits)} '
-         f'imgs={total_imgs} lbls={total_lbls} '
-         f'names={len(names) if names else 0}')""")
+log.info(f'DEBUG layout - splits={list(source_splits)} imgs={dbg_imgs} '
+         f'lbls={dbg_lbls} raw_classes={len(names) if names else 0}')""")
 
-code("""# 3.3 - Collect annotated stems per split + decide sampling mode.
-import random
+# ======================================================================
+# 4 - Full class analysis (validate every label)
+# ======================================================================
+md("""## 4 - Full class analysis (validate every label)
+Every label file is parsed line-by-line. A line is **valid** only if it has 5
+whitespace-separated fields `class x_center y_center width height`, an integer
+class id in range, and normalised coordinates in `[0, 1]` with positive size.
+Invalid lines are **dropped and counted**; images left with no valid label are
+excluded. The full **original** class distribution is saved to Drive.""")
 
-def collect_annotated(splits):
-    out = {}
-    for split, (img_dir, lbl_dir) in splits.items():
-        anns = []
+code("""# 4.1 - Parse + validate all labels; build the ORIGINAL class distribution.
+import re, math, csv
+from collections import defaultdict, Counter
+
+if not names:
+    log.warning('No class names found - inferring class count from labels.')
+    mx = -1
+    for split, (img_dir, lbl_dir) in source_splits.items():
         for lp in lbl_dir.glob('*.txt'):
-            if lp.stat().st_size == 0:
+            for ln in lp.read_text().splitlines():
+                ps = ln.split()
+                if ps:
+                    try: mx = max(mx, int(float(ps[0])))
+                    except ValueError: pass
+    names = [f'class_{i}' for i in range(max(mx + 1, 1))]
+NUM_RAW_CLASSES = len(names)
+
+def _find_ext(img_dir, stem):
+    for cand in ('.png', '.jpg', '.jpeg'):
+        if (img_dir / (stem + cand)).exists():
+            return cand
+    return None
+
+def parse_yolo_line(ln, num_classes):
+    p = ln.split()
+    if len(p) != 5:
+        return None, 'bad_format'
+    try:
+        cf = float(p[0])
+        if cf != int(cf):
+            return None, 'bad_class_id'
+        cid = int(cf)
+        coords = [float(x) for x in p[1:]]
+    except ValueError:
+        return None, 'bad_number'
+    if cid < 0 or cid >= num_classes:
+        return None, 'bad_class_id'
+    cx, cy, w, h = coords
+    if any(not (0.0 <= v <= 1.0) for v in coords) or w <= 0 or h <= 0:
+        return None, 'bad_bbox'
+    return (cid, cx, cy, w, h), None
+
+item_lines      = {}        # (split, stem, ext) -> [(cid, cx, cy, w, h), ...]
+orig_img_count  = Counter() # cid -> images containing it
+orig_lbl_count  = Counter() # cid -> total boxes
+invalid_counter = Counter() # reason -> count
+n_items = n_empty = n_no_image = 0
+
+for split, (img_dir, lbl_dir) in source_splits.items():
+    for lp in lbl_dir.glob('*.txt'):
+        stem = lp.stem
+        ext  = _find_ext(img_dir, stem)
+        if ext is None:
+            n_no_image += 1; continue
+        valid, present = [], set()
+        for ln in lp.read_text().splitlines():
+            if not ln.strip():
                 continue
-            stem = lp.stem
-            ext = None
-            for cand in ('.png', '.jpg', '.jpeg'):
-                if (img_dir / f'{stem}{cand}').exists():
-                    ext = cand; break
-            if ext is not None:
-                anns.append((stem, ext))
-        out[split] = sorted(anns)
-    return out
+            parsed, reason = parse_yolo_line(ln, NUM_RAW_CLASSES)
+            if parsed is None:
+                invalid_counter[reason] += 1; continue
+            valid.append(parsed); present.add(parsed[0])
+            orig_lbl_count[parsed[0]] += 1
+        if not valid:
+            n_empty += 1; continue
+        item_lines[(split, stem, ext)] = valid
+        for c in present:
+            orig_img_count[c] += 1
+        n_items += 1
 
-source_ann = collect_annotated(source_splits)
-for s, v in source_ann.items():
-    log.info(f'  annotated in {s}: {len(v)}')
+log.info(f'Analysed {n_items} annotated images  '
+         f'(empty/all-invalid: {n_empty}, label-without-image: {n_no_image})')
+log.info(f'Invalid label lines dropped: {dict(invalid_counter)}  '
+         f'total={sum(invalid_counter.values())}')
 
-# Use existing train/val/test splits if all three have a meaningful amount
-# of annotated data; otherwise re-split everything 80/10/10.
-present_with_anns = [s for s in ('train','val','test') if len(source_ann.get(s, [])) > 50]
-total_ann = sum(len(v) for v in source_ann.values())
-assert total_ann > 0, 'No annotated images found - cannot sample.'
+original_distribution = {}
+for c in range(NUM_RAW_CLASSES):
+    nm = names[c] if c < len(names) else f'class_{c}'
+    original_distribution[nm] = {'class_id': c,
+                                 'images': int(orig_img_count.get(c, 0)),
+                                 'labels': int(orig_lbl_count.get(c, 0))}
+Path(RESULTS_DIR, 'original_class_distribution.json').write_text(
+    json.dumps(original_distribution, indent=2))
+log.info(f'Wrote original_class_distribution.json ({NUM_RAW_CLASSES} raw classes)')
 
-PRESERVE_SPLITS = (len(present_with_anns) >= 2)
-log.info(f'Total annotated images: {total_ann}')
-log.info(f'Sampling mode: {"preserve source splits" if PRESERVE_SPLITS else "fresh 80/10/10 split"}')""")
+# Quick on-screen peek at the most/least common raw classes.
+ranked = sorted(range(NUM_RAW_CLASSES), key=lambda c: orig_img_count.get(c, 0))
+print('Rarest 8 raw classes :',
+      [(names[c], orig_img_count.get(c, 0)) for c in ranked[:8]])
+print('Top 8 raw classes    :',
+      [(names[c], orig_img_count.get(c, 0)) for c in ranked[-8:][::-1]])""")
 
-code("""# 3.4 - Build per-split sample lists (class-stratified when sub-sampling).
-from collections import defaultdict
+# ======================================================================
+# 5 - Merge classes into balanced semantic groups
+# ======================================================================
+md("""## 5 - Merge classes into balanced semantic groups
+The 62 fine-grained xView classes are merged into broader groups. Any class not
+covered by the mapping - including the placeholder/unknown classes `class_75`
+and `class_82` - is **dropped** (never trained on). Groups that end up rarer
+than `MIN_GROUP_IMAGES` are also dropped so the remaining classes can be
+balanced. The mapping and both distributions are saved to Drive.""")
 
-def label_classes(lbl_path):
-    cls = set()
-    for ln in lbl_path.read_text().splitlines():
-        p = ln.split()
-        if not p: continue
-        try: cls.add(int(float(p[0])))
-        except ValueError: pass
-    return cls
+code("""# 5.1 - Explicit class-group mapping (edit here to regroup).
+# Keys are the final merged group names; values are the raw xView class names
+# that fold into them. Names are matched case-insensitively and '/'-insensitively
+# so minor spelling/spacing differences still resolve.
+CLASS_GROUPS = {
+    'Aircraft': [
+        'Fixed-wing Aircraft', 'Small Aircraft', 'Cargo Plane', 'Helicopter'],
+    'Small Vehicle': [
+        'Passenger Vehicle', 'Small Car', 'Pickup Truck'],
+    'Truck / Bus': [
+        'Bus', 'Utility Truck', 'Truck', 'Cargo Truck', 'Truck w/Box',
+        'Truck Tractor', 'Trailer', 'Truck w/Flatbed', 'Truck w/Liquid',
+        'Crane Truck', 'Dump Truck', 'Haul Truck'],
+    'Rail Vehicle': [
+        'Railway Vehicle', 'Passenger Car', 'Cargo Car', 'Flat Car',
+        'Tank car', 'Locomotive'],
+    'Maritime Vessel': [
+        'Maritime Vessel', 'Motorboat', 'Sailboat', 'Tugboat', 'Barge',
+        'Fishing Vessel', 'Ferry', 'Yacht', 'Container Ship', 'Oil Tanker'],
+    'Construction Equipment': [
+        'Engineering Vehicle', 'Tower crane', 'Container Crane', 'Reach Stacker',
+        'Straddle Carrier', 'Mobile Crane', 'Scraper/Tractor',
+        'Front loader/Bulldozer', 'Excavator', 'Cement Mixer', 'Ground Grader'],
+    'Building / Facility': [
+        'Hut/Tent', 'Shed', 'Building', 'Aircraft Hangar', 'Damaged Building',
+        'Facility', 'Construction Site', 'Vehicle Lot', 'Helipad'],
+    'Storage Tank': [
+        'Storage Tank'],
+    'Shipping Container': [
+        'Shipping container lot', 'Shipping Container'],
+    'Infrastructure': [
+        'Pylon', 'Tower'],
+}
 
-def stratified_pick(pool, lbl_dir_fn, target_n, seed):
-    \"\"\"Round-robin pick over rare-first class buckets until we hit target_n.\"\"\"
+def _norm(s):
+    return ' '.join(str(s).lower().replace('/', ' ').split())
+
+name_to_group = {}
+for g, members in CLASS_GROUPS.items():
+    for m in members:
+        name_to_group[_norm(m)] = g
+
+UNKNOWN_RE = re.compile(r'^class_\\d+$', re.IGNORECASE)
+
+contig_to_group_name = {}
+unknown_classes = []
+for c in range(NUM_RAW_CLASSES):
+    nm = (names[c] if c < len(names) else f'class_{c}').strip()
+    if UNKNOWN_RE.match(nm):
+        contig_to_group_name[c] = None; unknown_classes.append(nm); continue
+    g = name_to_group.get(_norm(nm))
+    contig_to_group_name[c] = g
+    if g is None:
+        unknown_classes.append(nm)
+
+# Merged distribution BEFORE balancing.
+group_img_count = Counter()
+group_lbl_count = Counter()
+for key, lines in item_lines.items():
+    gpresent = set()
+    for (cid, *_rest) in lines:
+        g = contig_to_group_name.get(cid)
+        if g is not None:
+            gpresent.add(g); group_lbl_count[g] += 1
+    for g in gpresent:
+        group_img_count[g] += 1
+
+# Keep groups with enough images (preserve CLASS_GROUPS order); drop the rest.
+kept_group_names   = [g for g in CLASS_GROUPS if group_img_count.get(g, 0) >= MIN_GROUP_IMAGES]
+dropped_rare_groups = {g: int(group_img_count.get(g, 0)) for g in CLASS_GROUPS
+                       if 0 < group_img_count.get(g, 0) < MIN_GROUP_IMAGES}
+group_to_final_id  = {g: i for i, g in enumerate(kept_group_names)}
+contig_to_final_gid = {c: group_to_final_id.get(g)
+                       for c, g in contig_to_group_name.items()}
+dropped_rare_classes = [names[c] for c in range(NUM_RAW_CLASSES)
+                        if contig_to_group_name.get(c) in dropped_rare_groups]
+
+log.info('=== CLASS MERGE MAP ===')
+for g in CLASS_GROUPS:
+    fid = group_to_final_id.get(g, '-')
+    status = ('KEEP' if g in group_to_final_id
+              else ('DROP(rare)' if g in dropped_rare_groups else 'DROP(absent)'))
+    log.info(f'  [{str(fid):>2}] {g:24s} imgs={group_img_count.get(g,0):5d} '
+             f'lbls={group_lbl_count.get(g,0):6d}  {status}')
+log.info(f'Unknown/ambiguous classes dropped: {unknown_classes}')
+log.info(f'Kept groups ({len(kept_group_names)}): {kept_group_names}')
+
+class_group_mapping = {
+    'class_groups': CLASS_GROUPS,
+    'kept_groups': kept_group_names,
+    'group_to_final_id': group_to_final_id,
+    'dropped_unknown_classes': unknown_classes,
+    'dropped_rare_groups': dropped_rare_groups,
+    'dropped_rare_classes': dropped_rare_classes,
+    'min_group_images': MIN_GROUP_IMAGES,
+    'raw_class_names': list(names),
+}
+Path(RESULTS_DIR, 'class_group_mapping.json').write_text(
+    json.dumps(class_group_mapping, indent=2))
+log.info('Wrote class_group_mapping.json')
+
+assert kept_group_names, ('No class groups survived the MIN_GROUP_IMAGES filter - '
+                          'lower MIN_GROUP_IMAGES in the Config cell.')""")
+
+# ======================================================================
+# 6 - Build the class-balanced ~9k dataset
+# ======================================================================
+md("""## 6 - Build the class-balanced ~9k dataset
+Every image is remapped to the final group ids (labels for dropped classes are
+discarded; images left with no label are excluded). Images are then selected
+**rare-group-first** with a per-group cap so no single group dominates, then
+topped up toward `TARGET_TOTAL`. All labels are rewritten with the new group ids
+into a **separate** Drive folder - the original dataset is never touched.
+
+> **Honest note on balance.** Object detection is multi-label: one image can
+> contain several groups, and a few classes (buildings, small vehicles) appear
+> in most satellite scenes. So perfect per-class balance is impossible without
+> throwing away most images. This pipeline does **image-level** balancing -
+> rare-class images are all kept and majority-only images are under-sampled by
+> the per-group cap - and reports the **real** resulting distribution and
+> imbalance ratio rather than pretending the classes are perfectly even.""")
+
+code("""# 6.1 - Remap to final group ids; drop images with no kept label.
+item_groups        = {}   # key -> set(final gid)
+item_primary       = {}   # key -> rarest present gid
+item_source_split  = {}   # key -> source split name
+group_freq         = Counter()
+n_drop_unmapped    = 0
+for key, lines in item_lines.items():
+    gids = set()
+    for (cid, *_rest) in lines:
+        fg = contig_to_final_gid.get(cid)
+        if fg is not None:
+            gids.add(fg)
+    if not gids:
+        n_drop_unmapped += 1; continue
+    item_groups[key] = gids
+    item_source_split[key] = key[0]
+    for g in gids:
+        group_freq[g] += 1
+for key, gids in item_groups.items():
+    item_primary[key] = min(gids, key=lambda g: group_freq[g])
+log.info(f'Images with >=1 kept label: {len(item_groups)}  '
+         f'(dropped, no kept label: {n_drop_unmapped})')""")
+
+code("""# 6.2 - Class-balanced selection (rare-first; per-group cap under-samples majority).
+# Each image is bucketed by its RAREST present group, so rare groups are never
+# capped away. Every bucket is capped at ceil(TARGET_TOTAL / num_groups); if
+# BALANCE_FILL_TO_TARGET we then top up toward TARGET_TOTAL from the groups that
+# still have spare images (otherwise we stop at the caps for a stricter balance).
+import random
+def build_balanced_selection(item_primary, n_groups, target_total, fill, seed):
     rng = random.Random(seed)
     buckets = defaultdict(list)
-    for item in pool:
-        for c in label_classes(lbl_dir_fn(item)):
-            buckets[c].append(item)
-    for k in buckets:
-        rng.shuffle(buckets[k])
-    rare_first = sorted(buckets.keys(), key=lambda c: len(buckets[c]))
-    selected = []
-    seen = set()
-    cursor = {c: 0 for c in rare_first}
-    safety = 0
-    while len(selected) < target_n and safety < 2 * len(pool) + 10:
-        safety += 1
-        progressed = False
-        for c in rare_first:
-            while cursor[c] < len(buckets[c]):
-                cand = buckets[c][cursor[c]]; cursor[c] += 1
-                key = (cand[0], cand[1])
-                if key not in seen:
-                    seen.add(key); selected.append(cand); progressed = True; break
-            if len(selected) >= target_n: break
-        if not progressed: break
-    # If still short, fall back to random fill from remaining
-    if len(selected) < target_n:
-        leftovers = [it for it in pool if (it[0], it[1]) not in seen]
-        rng.shuffle(leftovers)
-        selected.extend(leftovers[:target_n - len(selected)])
-    return selected[:target_n]
+    for key, primary in item_primary.items():
+        buckets[primary].append(key)
+    for g in buckets:
+        rng.shuffle(buckets[g])
+    cap = max(1, math.ceil(target_total / max(1, n_groups)))
+    selected, cursor = [], {}
+    for g, items in buckets.items():
+        n = min(len(items), cap)
+        selected.extend(items[:n]); cursor[g] = n
+    if fill:
+        progressing = True
+        while len(selected) < target_total and progressing:
+            progressing = False
+            for g, items in buckets.items():
+                if cursor[g] < len(items):
+                    selected.append(items[cursor[g]]); cursor[g] += 1; progressing = True
+                    if len(selected) >= target_total:
+                        break
+    return selected[:target_total], cap
 
-def build_sample_lists():
-    rng = random.Random(SAMPLE_SEED)
-    if PRESERVE_SPLITS:
-        # Keep splits, sub-sample each proportionally if needed.
-        result = {'train': [], 'val': [], 'test': []}
-        total = sum(len(source_ann.get(s, [])) for s in present_with_anns)
-        for split in ('train', 'val', 'test'):
-            v = source_ann.get(split, [])
-            if not v:
-                continue
-            quota = max(1, int(SAMPLE_SIZE * len(v) / total))
-            pool = [(split, stem, ext) for (stem, ext) in v]
-            if len(pool) <= quota:
-                result[split] = pool
-            else:
-                result[split] = stratified_pick(
-                    pool, lambda it: source_splits[it[0]][1] / f'{it[1]}.txt',
-                    quota, SAMPLE_SEED + ord(split[0]))
-        return result
-    # Single-split / re-split path: pool everything, stratified pick to SAMPLE_SIZE,
-    # then 80/10/10.
-    pool = []
-    for split, v in source_ann.items():
-        for stem, ext in v:
-            pool.append((split, stem, ext))
-    if len(pool) <= SAMPLE_SIZE:
-        chosen = list(pool)
-    else:
-        chosen = stratified_pick(
-            pool, lambda it: source_splits[it[0]][1] / f'{it[1]}.txt',
-            SAMPLE_SIZE, SAMPLE_SEED)
-    rng.shuffle(chosen)
-    n = len(chosen)
-    n_train = int(n * SPLIT_RATIOS[0])
-    n_val   = int(n * SPLIT_RATIOS[1])
-    return {'train': chosen[:n_train],
-            'val':   chosen[n_train:n_train + n_val],
-            'test':  chosen[n_train + n_val:]}
+K = len(kept_group_names)
+selected, per_group_cap = build_balanced_selection(
+    item_primary, K, TARGET_TOTAL, BALANCE_FILL_TO_TARGET, SAMPLE_SEED)
+selected_set = set(selected)
+n_drop_not_selected = len(item_groups) - len(selected)
+log.info(f'Balanced selection: {len(selected)} images  '
+         f'(target ~{TARGET_TOTAL}, {K} groups, cap/grp {per_group_cap}, '
+         f'fill_to_target={BALANCE_FILL_TO_TARGET}, not selected: {n_drop_not_selected})')""")
 
-sample_lists = build_sample_lists()
-for s in ('train', 'val', 'test'):
-    log.info(f'  sample {s}: {len(sample_lists[s])} images')
-total_sample = sum(len(v) for v in sample_lists.values())
-log.info(f'Total sampled: {total_sample} (target ~{SAMPLE_SIZE})')""")
+code("""# 6.3 - Split selected images (preserve source splits if usable, else 80/10/10).
+present_splits  = [s for s in ('train','val','test')
+                   if sum(1 for k in selected if k[0] == s) > 50]
+PRESERVE_SPLITS = len(present_splits) >= 2
 
-code("""# 3.5 - Check Drive for an existing valid sample (reuse if present).
-def existing_sample_valid(drive_dir, sample_lists):
-    base = Path(drive_dir)
-    if FORCE_RESAMPLE or not base.exists():
-        return False
-    if not (base / 'data.yaml').exists():
-        return False
-    for split, items in sample_lists.items():
-        if not items: continue
-        img_dir = base / 'images' / split
-        lbl_dir = base / 'labels' / split
-        if not img_dir.is_dir() or not lbl_dir.is_dir():
-            return False
-        # Spot-check 50 random expected files
-        rng = random.Random(99)
-        check = rng.sample(items, min(50, len(items)))
-        for src_split, stem, ext in check:
-            if not (img_dir / f'{stem}{ext}').exists(): return False
-            if not (lbl_dir / f'{stem}.txt').exists(): return False
-    return True
+def assign_splits(selected, preserve, ratios, seed):
+    out = {'train': [], 'val': [], 'test': []}
+    if preserve:
+        for key in selected:
+            s = key[0] if key[0] in out else 'train'
+            out[s].append(key)
+        return out
+    rng = random.Random(seed + 1)
+    by_primary = defaultdict(list)
+    for key in selected:
+        by_primary[item_primary[key]].append(key)
+    for g, items in by_primary.items():
+        rng.shuffle(items)
+        n = len(items); ntr = int(n * ratios[0]); nval = int(n * ratios[1])
+        out['train'] += items[:ntr]
+        out['val']   += items[ntr:ntr + nval]
+        out['test']  += items[ntr + nval:]
+    return out
 
-SAMPLE_REUSED = existing_sample_valid(DRIVE_SAMPLE_DIR, sample_lists)
-log.info(f'Existing Drive sample valid: {SAMPLE_REUSED}'
-         + ('  -> skipping copy' if SAMPLE_REUSED else ''))""")
+split_assignment = assign_splits(selected, PRESERVE_SPLITS, SPLIT_RATIOS, SAMPLE_SEED)
+for s in ('train','val','test'):
+    log.info(f'  split {s}: {len(split_assignment[s])} images')
+log.info(f'Split mode: {"preserve source" if PRESERVE_SPLITS else "fresh stratified 80/10/10"}')
 
-code("""# 3.6 - Copy the sampled images + labels to Drive (idempotent, skip-if-exists).
-def copy_sample_to_drive(target_root, sample_lists, source_splits, log_every=500):
-    target_root = Path(target_root)
-    copied = skipped = failed = 0
-    for split, items in sample_lists.items():
-        if not items: continue
-        img_out = target_root / 'images' / split
-        lbl_out = target_root / 'labels' / split
-        img_out.mkdir(parents=True, exist_ok=True)
-        lbl_out.mkdir(parents=True, exist_ok=True)
-        for i, (src_split, stem, ext) in enumerate(items, 1):
-            src_img = source_splits[src_split][0] / f'{stem}{ext}'
-            src_lbl = source_splits[src_split][1] / f'{stem}.txt'
-            dst_img = img_out / f'{stem}{ext}'
-            dst_lbl = lbl_out / f'{stem}.txt'
-            try:
-                if (not dst_img.exists()
-                        or dst_img.stat().st_size != src_img.stat().st_size):
-                    shutil.copy2(src_img, dst_img); copied += 1
-                else:
-                    skipped += 1
-                shutil.copy2(src_lbl, dst_lbl)
-            except Exception as e:
-                failed += 1
-                if failed <= 3:
-                    log.warning(f'  copy failed {stem}: {e}')
-            if i % log_every == 0:
-                log.info(f'    {split}: {i}/{len(items)}  copied={copied} reused={skipped}')
-        log.info(f'  {split} done: {len(items)} pairs ready (copied={copied} reused={skipped})')
-    log.info(f'Copy summary: copied={copied} reused={skipped} failed={failed}')
+# Final balanced per-group distribution (images + labels).
+balanced_img_count = Counter()
+balanced_lbl_count = Counter()
+for key in selected:
+    gids = set()
+    for (cid, *_rest) in item_lines[key]:
+        fg = contig_to_final_gid.get(cid)
+        if fg is not None:
+            balanced_lbl_count[fg] += 1; gids.add(fg)
+    for g in gids:
+        balanced_img_count[g] += 1""")
 
-if SAMPLE_REUSED:
-    log.info('Skipping copy - Drive sample already complete.')
-else:
-    log.info(f'Building sample at {DRIVE_SAMPLE_DIR}  '
-             '(Drive FUSE writes are slow; this may take a few minutes)...')
-    copy_sample_to_drive(DRIVE_SAMPLE_DIR, sample_lists, source_splits)""")
-
-code("""# 3.7 - Write/refresh data.yaml + class_map + seg_class_map + stats on Drive.
-# Names: parsed if available, else inferred from labels.
-if names is None:
-    log.warning('Class names not found - inferring from label contents.')
-    max_cls = -1
-    for split, items in sample_lists.items():
-        for src_split, stem, _ext in items:
-            lp = source_splits[src_split][1] / f'{stem}.txt'
-            try:
-                for ln in lp.read_text().splitlines():
-                    p = ln.split()
-                    if p:
-                        try: max_cls = max(max_cls, int(float(p[0])))
-                        except ValueError: pass
-            except Exception:
-                pass
-    nc = max_cls + 1
-    names = [f'class_{i}' for i in range(max(nc, 1))]
-NUM_CLASSES = len(names)
-log.info(f'NUM_CLASSES = {NUM_CLASSES}')
-
-# data.yaml on Drive - the local mirror gets its own copy with path updated.
-names_block = '\\n'.join(f'  {i}: {n}' for i, n in enumerate(names))
-data_yaml_text = (
-    '# Auto-generated by SkyLogic Sample-9k Colab notebook.\\n'
-    '# `path:` is rewritten to the local mirror at training time for speed.\\n'
-    f'path: {DRIVE_SAMPLE_DIR}\\n'
-    'train: images/train\\n'
-    'val: images/val\\n'
-    'test: images/test\\n'
-    f'nc: {NUM_CLASSES}\\n'
-    'names:\\n' + names_block + '\\n'
-)
-Path(DRIVE_SAMPLE_DIR, 'data.yaml').write_text(data_yaml_text)
-
-if class_map is not None:
-    Path(DRIVE_SAMPLE_DIR, 'class_map.json').write_text(json.dumps(class_map, indent=2))
-
-# 10-class disaster mapping for SegFormer pseudo-masks.
-SEG_CLASS_NAMES = ['background','building','damaged_building','vehicle','road',
-                   'vegetation','water_flood','debris_rubble','construction','container']
-XVIEW_SPARSE_TO_SEG = {
-    73:1, 71:1,72:1,74:1,75:1,76:1,84:1,85:1, 77:1,86:1,
-    79:8, 78:8, 87:7,
-    18:3,19:3,20:3,21:3,23:3,24:3,25:3,26:3,27:3,28:3,
-    34:3,35:3,36:3,37:3,38:3,53:3,54:3,55:3,56:3,57:3,
-    59:3,60:3,61:3,62:3,63:3,64:3,65:3,66:3,
-    11:3,12:3,13:3,15:3,17:3,
-    40:3,41:3,42:3,44:3,45:3,47:3,49:3,50:3,51:3,52:3,
-    83:3, 89:9,
-}
-contig_to_seg = {}
-if class_map and 'sparse_to_contiguous' in class_map:
-    s2c = {int(k): int(v) for k, v in class_map['sparse_to_contiguous'].items()}
-    for sparse_id, contig_id in s2c.items():
-        contig_to_seg[contig_id] = XVIEW_SPARSE_TO_SEG.get(sparse_id, 0)
-    for c in range(NUM_CLASSES):
-        contig_to_seg.setdefault(c, 0)
-else:
-    # name-based heuristic (works for generic xView-like names)
-    BUILD = {'building','damaged building','facility','shed','hut','tent','hangar'}
-    VEHIC = {'car','truck','bus','vehicle','plane','aircraft','boat','ship','yacht',
-             'ferry','train','locomotive','passenger','cargo','tugboat','barge',
-             'motorboat','sailboat','helicopter','railway','locomotive'}
-    CONSTR= {'construction','crane','bulldozer','excavator','cement','grader',
-             'dump','loader','scraper','tower crane','reach stacker'}
-    CONT  = {'container','shipping'}
-    for i, nm in enumerate(names):
-        n = nm.lower()
-        if   any(w in n for w in CONT):   contig_to_seg[i] = 9
-        elif any(w in n for w in CONSTR): contig_to_seg[i] = 8
-        elif any(w in n for w in BUILD):  contig_to_seg[i] = 1
-        elif any(w in n for w in VEHIC):  contig_to_seg[i] = 3
-        else:                              contig_to_seg[i] = 0
-seg_map_obj = {
-    'seg_class_names': SEG_CLASS_NAMES,
-    'num_seg_classes': len(SEG_CLASS_NAMES),
-    'contiguous_to_seg': {str(k): v for k, v in sorted(contig_to_seg.items())},
-}
-Path(DRIVE_SAMPLE_DIR, 'seg_class_map.json').write_text(json.dumps(seg_map_obj, indent=2))
-
-# Stats snapshot
-stats = {
-    'total_images': total_sample,
-    'splits': {s: len(v) for s, v in sample_lists.items()},
-    'split_ratios': list(SPLIT_RATIOS),
-    'sampling_mode': 'preserve' if PRESERVE_SPLITS else 'fresh 80/10/10',
-    'sample_size_config': SAMPLE_SIZE,
-    'num_classes': NUM_CLASSES,
-    'seed': SAMPLE_SEED,
-    'reused_existing_drive_sample': SAMPLE_REUSED,
-}
-Path(DRIVE_SAMPLE_DIR, 'dataset_stats.json').write_text(json.dumps(stats, indent=2))
-log.info(f'Wrote data.yaml + seg_class_map.json + dataset_stats.json to {DRIVE_SAMPLE_DIR}')""")
-
-code("""# 3.8 - Mirror the Drive sample to /content for fast training reads.
+code("""# 6.4 - Write the balanced dataset to Drive (idempotent; remapped labels).
 def mirror_to_local(drive_root, local_root, log_every=1000):
     drive_root = Path(drive_root); local_root = Path(local_root)
-    # Quick-skip if local already matches Drive counts (and no force).
-    if local_root.exists() and (local_root / 'data.yaml').exists() and not FORCE_RESAMPLE:
+    if local_root.exists() and (local_root/'data.yaml').exists() and not FORCE_RESAMPLE:
         ok = True
         for split in ('train','val','test'):
-            d = drive_root / 'images' / split
-            l = local_root / 'images' / split
+            d = drive_root/'images'/split; l = local_root/'images'/split
             if d.exists() and not l.exists(): ok = False; break
-            if d.exists() and l.exists():
-                if len(list(d.iterdir())) != len(list(l.iterdir())):
-                    ok = False; break
+            if d.exists() and l.exists() and len(list(d.iterdir())) != len(list(l.iterdir())):
+                ok = False; break
         if ok:
-            log.info(f'Local mirror already valid at {local_root} - skipping.')
-            return
+            log.info(f'Local mirror already valid at {local_root} - skipping.'); return
     if local_root.exists() and FORCE_RESAMPLE:
         shutil.rmtree(local_root, ignore_errors=True)
     local_root.mkdir(parents=True, exist_ok=True)
     n = 0
     for src in drive_root.rglob('*'):
         if src.is_dir(): continue
-        rel = src.relative_to(drive_root)
-        dst = local_root / rel
+        dst = local_root / src.relative_to(drive_root)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists() and dst.stat().st_size == src.stat().st_size:
-            continue
+        if dst.exists() and dst.stat().st_size == src.stat().st_size: continue
         shutil.copy2(src, dst); n += 1
-        if n % log_every == 0:
-            log.info(f'    mirrored {n} files ...')
-    log.info(f'Local mirror complete: {n} new files copied to {local_root}')
+        if n % log_every == 0: log.info(f'    mirrored {n} files ...')
+    log.info(f'Local mirror complete: {n} new files -> {local_root}')
 
-mirror_to_local(DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR)
+def balanced_exists_valid(drive_dir, split_assignment):
+    base = Path(drive_dir)
+    if FORCE_RESAMPLE or not base.exists() or not (base/'data.yaml').exists():
+        return False
+    rng = random.Random(99)
+    for split, items in split_assignment.items():
+        if not items: continue
+        img_dir = base/'images'/split; lbl_dir = base/'labels'/split
+        if not img_dir.is_dir() or not lbl_dir.is_dir(): return False
+        for (s, stem, ext) in rng.sample(items, min(40, len(items))):
+            if not (img_dir/f'{stem}{ext}').exists(): return False
+            if not (lbl_dir/f'{stem}.txt').exists():  return False
+    return True
 
-# Rewrite the LOCAL data.yaml `path:` so YOLOv12 reads from /content (fast).
-local_yaml = Path(LOCAL_SAMPLE_DIR) / 'data.yaml'
+def write_remapped_label(dst_lbl, key):
+    out = []
+    for (cid, cx, cy, w, h) in item_lines[key]:
+        fg = contig_to_final_gid.get(cid)
+        if fg is None: continue
+        out.append(f'{fg} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}')
+    dst_lbl.write_text('\\n'.join(out) + '\\n')
+
+def build_balanced_dataset(drive_dir, split_assignment, source_splits, log_every=500):
+    base = Path(drive_dir); copied = skipped = failed = 0
+    for split, items in split_assignment.items():
+        img_out = base/'images'/split; lbl_out = base/'labels'/split
+        img_out.mkdir(parents=True, exist_ok=True); lbl_out.mkdir(parents=True, exist_ok=True)
+        for i, key in enumerate(items, 1):
+            s, stem, ext = key
+            src_img = source_splits[s][0] / f'{stem}{ext}'
+            dst_img = img_out / f'{stem}{ext}'; dst_lbl = lbl_out / f'{stem}.txt'
+            try:
+                if not dst_img.exists() or dst_img.stat().st_size != src_img.stat().st_size:
+                    shutil.copy2(src_img, dst_img); copied += 1
+                else:
+                    skipped += 1
+                write_remapped_label(dst_lbl, key)
+            except Exception as e:
+                failed += 1
+                if failed <= 3: log.warning(f'  copy failed {stem}: {e}')
+            if i % log_every == 0:
+                log.info(f'    {split}: {i}/{len(items)} copied={copied} reused={skipped}')
+        log.info(f'  {split} done: {len(items)} pairs (copied={copied} reused={skipped})')
+    log.info(f'Copy summary: copied={copied} reused={skipped} failed={failed}')
+
+BALANCED_REUSED = balanced_exists_valid(BALANCED_DIR, split_assignment)
+if BALANCED_REUSED:
+    log.info('Existing balanced dataset on Drive is valid - skipping copy.')
+else:
+    log.info(f'Writing balanced dataset to {BALANCED_DIR} '
+             '(Drive FUSE writes are slow; this may take a few minutes)...')
+    build_balanced_dataset(BALANCED_DIR, split_assignment, source_splits)""")
+
+code("""# 6.5 - data.yaml + class_group_mapping.json + balance report (JSON + CSV).
+NUM_CLASSES        = K
+group_names_final  = list(kept_group_names)   # list index == final group id
+
+names_block = '\\n'.join(f'  {i}: {n}' for i, n in enumerate(group_names_final))
+data_yaml_text = (
+    '# Auto-generated balanced dataset (YOLOv12) - merged + class-balanced.\\n'
+    f'path: {BALANCED_DIR}\\n'
+    'train: images/train\\n'
+    'val: images/val\\n'
+    'test: images/test\\n'
+    f'nc: {NUM_CLASSES}\\n'
+    'names:\\n' + names_block + '\\n'
+)
+Path(BALANCED_DIR, 'data.yaml').write_text(data_yaml_text)
+Path(BALANCED_DIR, 'class_group_mapping.json').write_text(
+    json.dumps(class_group_mapping, indent=2))
+
+balance_report = {
+    'target_total': TARGET_TOTAL,
+    'min_group_images': MIN_GROUP_IMAGES,
+    'seed': SAMPLE_SEED,
+    'split_mode': 'preserve' if PRESERVE_SPLITS else 'fresh_stratified_80_10_10',
+    'raw_num_classes': NUM_RAW_CLASSES,
+    'final_num_classes': NUM_CLASSES,
+    'final_group_names': group_names_final,
+    'splits': {s: len(v) for s, v in split_assignment.items()},
+    'final_total_images': len(selected),
+    'original_distribution': original_distribution,
+    'class_group_mapping': {g: CLASS_GROUPS[g] for g in CLASS_GROUPS},
+    'merged_distribution_before_balance': {
+        g: {'images': int(group_img_count.get(g, 0)),
+            'labels': int(group_lbl_count.get(g, 0))} for g in CLASS_GROUPS},
+    'balanced_distribution': {
+        group_names_final[g]: {'images': int(balanced_img_count.get(g, 0)),
+                               'labels': int(balanced_lbl_count.get(g, 0))}
+        for g in range(NUM_CLASSES)},
+    'per_group_cap': int(per_group_cap),
+    'balance_fill_to_target': bool(BALANCE_FILL_TO_TARGET),
+    'imbalance_ratio_images': round(
+        max(balanced_img_count.values()) / max(1, min(balanced_img_count.get(g, 0)
+            for g in range(NUM_CLASSES))), 2) if balanced_img_count else None,
+    'dropped_unknown_classes': unknown_classes,
+    'dropped_rare_groups': dropped_rare_groups,
+    'dropped_rare_classes': dropped_rare_classes,
+    'dropped_invalid_lines': int(sum(invalid_counter.values())),
+    'dropped_invalid_breakdown': dict(invalid_counter),
+    'dropped_images_no_kept_label': int(n_drop_unmapped),
+    'dropped_images_not_selected': int(n_drop_not_selected),
+    'images_without_matching_file': int(n_no_image),
+    'empty_or_all_invalid_images': int(n_empty),
+}
+Path(BALANCED_DIR, 'dataset_balance_report.json').write_text(json.dumps(balance_report, indent=2))
+Path(RESULTS_DIR, 'dataset_balance_report.json').write_text(json.dumps(balance_report, indent=2))
+
+csv_path = Path(BALANCED_DIR, 'dataset_balance_report.csv')
+with open(csv_path, 'w', newline='') as f:
+    w = csv.writer(f)
+    w.writerow(['original_id','original_name','group_name','final_group_id',
+                'images_with_class','labels_of_class','status'])
+    for c in range(NUM_RAW_CLASSES):
+        nm = names[c] if c < len(names) else f'class_{c}'
+        g  = contig_to_group_name.get(c)
+        fid = group_to_final_id.get(g, '')
+        status = ('dropped_unknown' if g is None
+                  else 'dropped_rare_group' if g in dropped_rare_groups else 'kept')
+        w.writerow([c, nm, g if g else '', fid,
+                    int(orig_img_count.get(c, 0)), int(orig_lbl_count.get(c, 0)), status])
+shutil.copy2(csv_path, Path(RESULTS_DIR, 'dataset_balance_report.csv'))
+log.info(f'Wrote data.yaml (nc={NUM_CLASSES}) + balance report JSON/CSV to {BALANCED_DIR}')""")
+
+code("""# 6.6 - Mirror balanced dataset to local SSD; rewrite data.yaml path for speed.
+mirror_to_local(BALANCED_DIR, LOCAL_BALANCED_DIR)
+local_yaml = Path(LOCAL_BALANCED_DIR) / 'data.yaml'
 cfg = yaml.safe_load(local_yaml.read_text())
-cfg['path'] = LOCAL_SAMPLE_DIR
+cfg['path'] = LOCAL_BALANCED_DIR
 local_yaml.write_text(yaml.safe_dump(cfg, sort_keys=False))
 DATA_YAML = str(local_yaml)
-log.info(f'Local data.yaml ready at {DATA_YAML}  (path: {LOCAL_SAMPLE_DIR})')""")
+names = group_names_final            # downstream verify/plots use final group names
+log.info(f'Local data.yaml ready: {DATA_YAML}  (nc={NUM_CLASSES}, path={LOCAL_BALANCED_DIR})')""")
 
 # ======================================================================
-# 4 - Dataset verification
+# 7 - Verify the balanced dataset
 # ======================================================================
-md("""## 4 - Dataset verification
-Hard checks before any training. Each label is parsed line-by-line:
+md("""## 7 - Verify the balanced dataset
+A final hard check on the **balanced** dataset: image<->label matching, 5-field
+lines, class ids in `[0, NUM_CLASSES)`, and bbox coords in `[0, 1]`. The labels
+were generated by this notebook, so this should pass cleanly; it is a safety
+net. Set `ALLOW_INVALID_LABELS = True` to proceed despite errors.""")
 
-- image <-> label match (both directions)
-- 5 whitespace-separated fields per line: `class x_center y_center width height`
-- class id is an integer in `[0, NUM_CLASSES)`
-- bbox coordinates are numeric and in `[0, 1]`
-- empty labels are counted (warning, not error)
-
-If any **hard** error is found, the cell raises `VerificationError` and stops
-the notebook. To proceed anyway, set `ALLOW_INVALID_LABELS = True` in the
-**Config** cell.""")
-
-code("""# 4.1 - Strong dataset verification
+code("""# 7.1 - Strong verification of the balanced dataset.
 class VerificationError(RuntimeError): pass
 
 def verify_dataset(local_root, num_classes):
-    base = Path(local_root)
-    per_split = {}
-    issue_samples = {'unmatched_images':[], 'unmatched_labels':[],
-                     'bad_format':[], 'bad_class_id':[], 'bad_bbox':[]}
-    class_counts = {}
+    base = Path(local_root); per_split = {}; class_counts = {}
+    issues = {'unmatched_images':[], 'unmatched_labels':[],
+              'bad_format':[], 'bad_class_id':[], 'bad_bbox':[]}
     for split in ('train', 'val', 'test'):
-        img_dir = base / 'images' / split
-        lbl_dir = base / 'labels' / split
+        img_dir = base/'images'/split; lbl_dir = base/'labels'/split
         if not img_dir.exists() and not lbl_dir.exists():
             per_split[split] = {'images':0,'labels':0}; continue
-        img_map = {p.stem: p.suffix for p in img_dir.glob('*')
+        img_map = {p.stem for p in img_dir.glob('*')
                    if p.is_file() and p.suffix.lower() in ('.png','.jpg','.jpeg')}
         lbl_set = {p.stem for p in lbl_dir.glob('*.txt')}
-        only_img = set(img_map) - lbl_set
-        only_lbl = lbl_set - set(img_map)
-        for s in sorted(only_img)[:10]: issue_samples['unmatched_images'].append(f'{split}/{s}')
-        for s in sorted(only_lbl)[:10]: issue_samples['unmatched_labels'].append(f'{split}/{s}')
+        only_img, only_lbl = img_map - lbl_set, lbl_set - img_map
+        for s in sorted(only_img)[:10]: issues['unmatched_images'].append(f'{split}/{s}')
+        for s in sorted(only_lbl)[:10]: issues['unmatched_labels'].append(f'{split}/{s}')
         empty = bad_fmt = bad_cls = bad_box = 0
         for stem in img_map:
             lp = lbl_dir / f'{stem}.txt'
             if not lp.exists(): continue
             content = lp.read_text().strip()
-            if not content:
-                empty += 1; continue
+            if not content: empty += 1; continue
             for li, ln in enumerate(content.splitlines(), 1):
                 p = ln.split()
                 if len(p) != 5:
                     bad_fmt += 1
-                    if len(issue_samples['bad_format']) < 10:
-                        issue_samples['bad_format'].append(
-                            f'{split}/{stem}.txt:{li} ({len(p)} fields)')
+                    if len(issues['bad_format']) < 10:
+                        issues['bad_format'].append(f'{split}/{stem}.txt:{li}')
                     continue
                 try:
                     cf = float(p[0])
                     if cf != int(cf): raise ValueError('not int')
                     c = int(cf)
-                    if c < 0 or c >= num_classes:
-                        raise ValueError(f'id {c} out of [0,{num_classes-1}]')
+                    if c < 0 or c >= num_classes: raise ValueError(f'id {c} out of range')
                     class_counts[c] = class_counts.get(c, 0) + 1
-                except ValueError as e:
+                except ValueError:
                     bad_cls += 1
-                    if len(issue_samples['bad_class_id']) < 10:
-                        issue_samples['bad_class_id'].append(
-                            f'{split}/{stem}.txt:{li} ({e})')
+                    if len(issues['bad_class_id']) < 10:
+                        issues['bad_class_id'].append(f'{split}/{stem}.txt:{li}')
                     continue
                 try:
                     coords = [float(x) for x in p[1:]]
                 except ValueError:
-                    bad_box += 1
-                    if len(issue_samples['bad_bbox']) < 10:
-                        issue_samples['bad_bbox'].append(
-                            f'{split}/{stem}.txt:{li} (non-numeric bbox)')
-                    continue
+                    bad_box += 1; continue
                 if any(not (0.0 <= x <= 1.0) for x in coords):
                     bad_box += 1
-                    if len(issue_samples['bad_bbox']) < 10:
-                        issue_samples['bad_bbox'].append(
-                            f'{split}/{stem}.txt:{li} (coords {coords} not in [0,1])')
-        per_split[split] = {
-            'images':       len(img_map),
-            'labels':       len(lbl_set),
-            'only_image':   len(only_img),
-            'only_label':   len(only_lbl),
-            'empty_labels': empty,
-            'bad_format':   bad_fmt,
-            'bad_class_id': bad_cls,
-            'bad_bbox':     bad_box,
-        }
-    return per_split, class_counts, issue_samples
+                    if len(issues['bad_bbox']) < 10:
+                        issues['bad_bbox'].append(f'{split}/{stem}.txt:{li}')
+        per_split[split] = {'images':len(img_map),'labels':len(lbl_set),
+                            'only_image':len(only_img),'only_label':len(only_lbl),
+                            'empty_labels':empty,'bad_format':bad_fmt,
+                            'bad_class_id':bad_cls,'bad_bbox':bad_box}
+    return per_split, class_counts, issues
 
-per_split, class_counts, issue_samples = verify_dataset(LOCAL_SAMPLE_DIR, NUM_CLASSES)
-
-log.info('=== DATASET VERIFICATION REPORT ===')
+per_split, class_counts, issue_samples = verify_dataset(LOCAL_BALANCED_DIR, NUM_CLASSES)
+log.info('=== BALANCED DATASET VERIFICATION ===')
 for s, st in per_split.items():
-    log.info(f'  {s:5s} | images={st["images"]:5d}  labels={st["labels"]:5d}'
-             f'  only_img={st.get("only_image",0)}  only_lbl={st.get("only_label",0)}'
-             f'  empty={st.get("empty_labels",0)}'
-             f'  bad_fmt={st.get("bad_format",0)}'
-             f'  bad_cls={st.get("bad_class_id",0)}'
-             f'  bad_bbox={st.get("bad_bbox",0)}')
-log.info(f'  Total annotations counted: {sum(class_counts.values())}')
-log.info(f'  Classes present in sample: {sum(1 for n in class_counts.values() if n>0)}/{NUM_CLASSES}')
+    log.info(f'  {s:5s} | images={st["images"]:5d} labels={st["labels"]:5d} '
+             f'only_img={st.get("only_image",0)} only_lbl={st.get("only_label",0)} '
+             f'empty={st.get("empty_labels",0)} bad_fmt={st.get("bad_format",0)} '
+             f'bad_cls={st.get("bad_class_id",0)} bad_bbox={st.get("bad_bbox",0)}')
+log.info(f'  Total annotations: {sum(class_counts.values())}  '
+         f'classes present: {sum(1 for n in class_counts.values() if n>0)}/{NUM_CLASSES}')
 
-if class_counts:
-    sorted_cls = sorted(class_counts.items(), key=lambda kv: kv[1])
-    log.info('  --- 5 rarest classes ---')
-    for c, n in sorted_cls[:5]:
-        nm = names[c] if c < len(names) else f'class_{c}'
-        log.info(f'    {nm:30s} {n}')
-    log.info('  --- 10 most common classes ---')
-    for c, n in sorted_cls[-10:][::-1]:
-        nm = names[c] if c < len(names) else f'class_{c}'
-        log.info(f'    {nm:30s} {n}')
-
-hard_errors = sum(st.get('only_image',0) + st.get('only_label',0)
-                  + st.get('bad_format',0) + st.get('bad_class_id',0)
-                  + st.get('bad_bbox',0) for st in per_split.values())
-
-# Save report to Drive (always)
+hard_errors = sum(st.get('only_image',0)+st.get('only_label',0)+st.get('bad_format',0)
+                  +st.get('bad_class_id',0)+st.get('bad_bbox',0) for st in per_split.values())
 Path(RESULTS_DIR, 'dataset_verification.json').write_text(json.dumps({
     'per_split': per_split, 'class_counts': class_counts,
     'issue_samples': {k: v for k, v in issue_samples.items() if v},
-    'num_classes': NUM_CLASSES,
-}, indent=2))
+    'num_classes': NUM_CLASSES}, indent=2))
 
 if hard_errors > 0:
     log.warning(f'!!! Verification found {hard_errors} hard errors. Examples:')
     for k, vs in issue_samples.items():
-        if vs:
-            log.warning(f'  {k}:')
-            for v in vs[:5]:
-                log.warning(f'    {v}')
+        for v in vs[:5]: log.warning(f'  {k}: {v}')
     if not ALLOW_INVALID_LABELS:
-        raise VerificationError(
-            f'Dataset has {hard_errors} hard errors (see above). Fix them, '
-            'or set ALLOW_INVALID_LABELS = True in the Config cell to proceed.')
+        raise VerificationError(f'{hard_errors} hard errors - fix them or set '
+                                'ALLOW_INVALID_LABELS = True in the Config cell.')
     log.warning('ALLOW_INVALID_LABELS = True -> proceeding despite errors.')
 else:
-    log.info('Dataset verification PASSED.')""")
+    log.info('Balanced dataset verification PASSED.')""")
 
 # ======================================================================
-# 5 - YOLOv12 training
+# 8 - FINAL TRAINING DATASET SUMMARY
 # ======================================================================
-md("## 5 - YOLOv12 training")
+md("""## 8 - FINAL TRAINING DATASET SUMMARY
+Printed **before any training** so you can confirm exactly what YOLOv12 will
+learn from: the real image counts, the final merged classes, and everything
+that was dropped along the way.""")
 
-code("""# 5.1 - Install YOLOv12 + SegFormer dependencies
+code("""# 8.1 - FINAL TRAINING DATASET SUMMARY
+print('=' * 78)
+print(' FINAL TRAINING DATASET SUMMARY')
+print('=' * 78)
+print(f'Output dataset path : {BALANCED_DIR}')
+print(f'Local training copy : {LOCAL_BALANCED_DIR}')
+print(f'data.yaml           : {DATA_YAML}')
+print()
+print(f'Total sampled images: {len(selected)}   (target ~{TARGET_TOTAL})')
+print(f'  train : {len(split_assignment["train"])}')
+print(f'  val   : {len(split_assignment["val"])}')
+print(f'  test  : {len(split_assignment["test"])}')
+print()
+print(f'Final classes (merged groups): {NUM_CLASSES}   '
+      f'(per-group cap {per_group_cap}, fill_to_target={BALANCE_FILL_TO_TARGET})')
+print(f'  {"id":>3}  {"group":24s} {"images":>8s} {"labels":>9s}')
+for g in range(NUM_CLASSES):
+    print(f'  {g:>3}  {group_names_final[g]:24s} '
+          f'{balanced_img_count.get(g,0):8d} {balanced_lbl_count.get(g,0):9d}')
+_iv = [balanced_img_count.get(g, 0) for g in range(NUM_CLASSES)]
+print(f'  image imbalance ratio (max/min): '
+      f'{max(_iv)/max(1,min(_iv)):.1f}x  (multi-label; not perfectly balanceable)')
+print()
+print(f'Dropped unknown/ambiguous classes : {unknown_classes}')
+print(f'Dropped rare-group classes        : {dropped_rare_classes}')
+print(f'Dropped rare groups               : {dropped_rare_groups}')
+print(f'Dropped invalid label lines       : {sum(invalid_counter.values())} '
+      f'{dict(invalid_counter)}')
+print(f'Dropped images (no kept label)    : {n_drop_unmapped}')
+print(f'Dropped images (balance/not sel.) : {n_drop_not_selected}')
+print('=' * 78)
+log.info('FINAL TRAINING DATASET SUMMARY printed - starting YOLOv12 next.')""")
+
+# ======================================================================
+# 9 - YOLOv12 training
+# ======================================================================
+md("""## 9 - YOLOv12 training
+Resume-aware: checkpoints are written straight to Drive (`last.pt` every epoch,
+`epoch{N}.pt` every `save_period`). On a re-run after a disconnect, training
+resumes automatically from `last.pt`.
+
+> **On accuracy:** this notebook reports **only the real validation metrics**
+> measured below. It does **not** hardcode or guarantee any number. Whether
+> YOLOv12 reaches high mAP depends on dataset/label quality, how visually
+> separable the merged groups are, images-per-class after balancing, the model
+> size (`yolo12n/s/m`), image resolution, and how long you train.""")
+
+code("""# 9.1 - Install YOLOv12 (Ultralytics).
 !pip install -q -U ultralytics
-!pip install -q -U transformers
-import ultralytics, transformers
+import ultralytics
 ultralytics.checks()
-log.info(f'ultralytics {ultralytics.__version__} | transformers {transformers.__version__}')""")
+log.info(f'ultralytics {ultralytics.__version__}')""")
 
-code("""# 5.2 - YOLOv12 training (resume-aware: checkpoints live on Drive)
+code("""# 9.2 - YOLOv12 training (resume-aware; checkpoints live on Drive).
 from ultralytics import YOLO
 
 run_dir     = Path(YOLO_PROJECT_DIR) / YOLO_RUN_NAME
@@ -923,26 +1065,25 @@ elif last_ckpt.exists():
     yolo_model = YOLO(str(last_ckpt))
     yolo_model.train(resume=True)
 else:
-    log.info(f'Fresh YOLOv12 training: {YOLO_MODEL}')
+    log.info(f'Fresh YOLOv12 training: {YOLO_MODEL}  (nc={NUM_CLASSES})')
     yolo_model = YOLO(YOLO_MODEL)
     yolo_model.train(
         data=DATA_YAML, epochs=YOLO_EPOCHS, imgsz=YOLO_IMGSZ, batch=YOLO_BATCH,
         patience=YOLO_PATIENCE, device=0,
         project=YOLO_PROJECT_DIR, name=YOLO_RUN_NAME, exist_ok=True,
-        save_period=5,         # frequent epoch checkpoints (last.pt every epoch)
-        workers=2, cache='disk', amp=True,
+        save_period=5, workers=2, cache='disk', amp=True,
         mosaic=0.5, mixup=0.05, close_mosaic=10,
         optimizer='auto', lr0=0.01, lrf=0.01, seed=SAMPLE_SEED,
         plots=True, verbose=True)
 log.info('YOLOv12 training stage complete.')""")
 
 # ======================================================================
-# 6 - YOLOv12 validation/inference
+# 10 - Validation, inference, metrics (real numbers only)
 # ======================================================================
-md("## 6 - YOLOv12 validation/inference")
+md("## 10 - Validation, inference, metrics (real numbers only)")
 
-code("""# 6.1 - YOLOv12 validation on the val split
-yolo_model = YOLO(str(best_ckpt))
+code("""# 10.1 - Validate the best checkpoint on the val split (REAL metrics).
+yolo_model  = YOLO(str(best_ckpt))
 val_metrics = yolo_model.val(data=DATA_YAML, imgsz=YOLO_IMGSZ, batch=YOLO_BATCH,
                              device=0, split='val', verbose=False)
 yolo_scores = {
@@ -951,23 +1092,24 @@ yolo_scores = {
     'precision':    float(val_metrics.box.mp),
     'recall':       float(val_metrics.box.mr),
 }
+print('--- YOLOv12 validation metrics (measured, not hardcoded) ---')
 for k, v in yolo_scores.items():
+    print(f'  {k:14s}: {v:.4f}')
     log.info(f'  YOLOv12 {k:14s}: {v:.4f}')""")
 
-code("""# 6.2 - YOLOv12 inference visualisation on random test images
-import random, matplotlib.pyplot as plt
-test_imgs = sorted((Path(LOCAL_SAMPLE_DIR) / 'images' / 'test').glob('*.png')) \\
-            + sorted((Path(LOCAL_SAMPLE_DIR) / 'images' / 'test').glob('*.jpg'))
+code("""# 10.2 - Inference visualisation on random test images.
+import matplotlib.pyplot as plt
+test_imgs = sorted((Path(LOCAL_BALANCED_DIR)/'images'/'test').glob('*.png')) \\
+          + sorted((Path(LOCAL_BALANCED_DIR)/'images'/'test').glob('*.jpg'))
 if test_imgs:
     random.seed(0)
     sample = random.sample(test_imgs, min(6, len(test_imgs)))
-    preds = yolo_model.predict(sample, imgsz=YOLO_IMGSZ, conf=0.25, device=0,
-                                verbose=False)
+    preds = yolo_model.predict(sample, imgsz=YOLO_IMGSZ, conf=0.25, device=0, verbose=False)
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
     for ax, pred in zip(axes.flat, preds):
-        ax.imshow(pred.plot()[..., ::-1])
-        ax.set_title(Path(pred.path).name, fontsize=8)
+        ax.imshow(pred.plot()[..., ::-1]); ax.set_title(Path(pred.path).name, fontsize=8)
         ax.axis('off')
+    for ax in axes.flat[len(preds):]: ax.axis('off')
     plt.tight_layout()
     viz = f'{RESULTS_DIR}/yolov12_predictions.png'
     plt.savefig(viz, dpi=110, bbox_inches='tight'); plt.show()
@@ -975,247 +1117,69 @@ if test_imgs:
 else:
     log.warning('No test images available for inference visualisation.')""")
 
-code("""# 6.3 - YOLOv12 metrics export (CSV + JSON)
+code("""# 10.3 - Export YOLOv12 metrics + per-class table (JSON + CSV).
 yolo_metrics = {'model': YOLO_MODEL, 'epochs_config': YOLO_EPOCHS,
                 'imgsz': YOLO_IMGSZ, 'batch': YOLO_BATCH,
-                'epochs_done': done_epochs, **yolo_scores}
+                'epochs_done': done_epochs, 'num_classes': NUM_CLASSES,
+                'class_names': group_names_final, **yolo_scores}
+
+# Per-class AP (real values from the validator), when available.
+try:
+    per_class_ap = {group_names_final[int(ci)]: float(ap)
+                    for ci, ap in zip(val_metrics.box.ap_class_index,
+                                      val_metrics.box.ap50)}
+    yolo_metrics['per_class_mAP50'] = per_class_ap
+    print('--- per-class mAP@0.5 ---')
+    for nm, ap in per_class_ap.items():
+        print(f'  {nm:24s}: {ap:.4f}')
+except Exception as e:
+    log.warning(f'per-class AP unavailable: {e}')
+
 with open(f'{RESULTS_DIR}/yolov12_metrics.json', 'w') as f:
     json.dump(yolo_metrics, f, indent=2)
 if results_csv.exists():
     shutil.copy2(results_csv, f'{RESULTS_DIR}/yolov12_results.csv')
-log.info('YOLOv12 metrics exported:\\n' + json.dumps(yolo_metrics, indent=2))""")
-
-# ======================================================================
-# 7 - SegFormer training
-# ======================================================================
-md("## 7 - SegFormer training")
-
-code("""# 7.1 - SegFormer dataset: bbox -> weak pseudo-mask (10 disaster classes)
-import numpy as np, torch
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-
-_seg = json.loads((Path(LOCAL_SAMPLE_DIR) / 'seg_class_map.json').read_text())
-CONTIG_TO_SEG = {int(k): int(v) for k, v in _seg['contiguous_to_seg'].items()}
-SEG_NAMES = _seg['seg_class_names']
-
-class WeakSegDataset(Dataset):
-    MEAN = np.array([0.485, 0.456, 0.406], np.float32)
-    STD  = np.array([0.229, 0.224, 0.225], np.float32)
-    def __init__(self, split, img_size):
-        base = Path(LOCAL_SAMPLE_DIR)
-        self.imgs = sorted((base/'images'/split).glob('*.png')) \\
-                  + sorted((base/'images'/split).glob('*.jpg'))
-        self.lbl_dir = base / 'labels' / split
-        self.S = img_size
-    def __len__(self): return len(self.imgs)
-    def _mask(self, stem):
-        m = np.zeros((self.S, self.S), np.int64)
-        lp = self.lbl_dir / f'{stem}.txt'
-        if not lp.exists(): return m
-        boxes = []
-        for ln in lp.read_text().splitlines():
-            p = ln.split()
-            if len(p) != 5: continue
-            try:
-                cid = int(float(p[0])); cx, cy, w, h = map(float, p[1:])
-            except ValueError:
-                continue
-            seg = CONTIG_TO_SEG.get(cid, 0)
-            if seg > 0:
-                boxes.append((w*h, seg, cx, cy, w, h))
-        for _, seg, cx, cy, w, h in sorted(boxes, reverse=True):
-            x1 = max(0, int((cx - w/2) * self.S))
-            y1 = max(0, int((cy - h/2) * self.S))
-            x2 = min(self.S, int((cx + w/2) * self.S))
-            y2 = min(self.S, int((cy + h/2) * self.S))
-            m[y1:y2, x1:x2] = seg
-        return m
-    def __getitem__(self, i):
-        p = self.imgs[i]
-        img = Image.open(p).convert('RGB').resize((self.S, self.S))
-        arr = (np.asarray(img, np.float32)/255.0 - self.MEAN) / self.STD
-        x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-        y = torch.from_numpy(self._mask(p.stem))
-        return x, y
-
-seg_train = WeakSegDataset('train', SEG_IMGSZ)
-seg_val   = WeakSegDataset('val',   SEG_IMGSZ)
-log.info(f'SegFormer dataset: {len(seg_train)} train / {len(seg_val)} val')""")
-
-code("""# 7.2 - SegFormer training (resume-aware, checkpoints every epoch to Drive)
-import time
-from transformers import SegformerForSemanticSegmentation
-
-SEG_CKPT = f'{SEG_DIR}/segformer_last.pt'
-SEG_BEST = f'{SEG_DIR}/segformer_best.pt'
-
-train_loader = DataLoader(seg_train, batch_size=SEG_BATCH, shuffle=True,
-                          num_workers=2, pin_memory=True, drop_last=True)
-val_loader   = DataLoader(seg_val, batch_size=SEG_BATCH, shuffle=False,
-                          num_workers=2, pin_memory=True)
-
-seg_model = SegformerForSemanticSegmentation.from_pretrained(
-    SEG_BACKBONE, num_labels=NUM_SEG_CLASSES,
-    ignore_mismatched_sizes=True).to('cuda')
-opt = torch.optim.AdamW(seg_model.parameters(), lr=SEG_LR, weight_decay=1e-4)
-scaler = torch.amp.GradScaler('cuda')
-
-start_epoch, best_miou = 0, 0.0
-if os.path.exists(SEG_CKPT):
-    ck = torch.load(SEG_CKPT, map_location='cuda')
-    seg_model.load_state_dict(ck['model'])
-    opt.load_state_dict(ck['opt'])
-    start_epoch = ck['epoch'] + 1
-    best_miou = ck.get('best_miou', 0.0)
-    log.info(f'Resuming SegFormer @ epoch {start_epoch}  best_mIoU={best_miou:.4f}')
-
-def seg_evaluate():
-    seg_model.eval()
-    cm = np.zeros((NUM_SEG_CLASSES, NUM_SEG_CLASSES), np.int64)
-    with torch.no_grad():
-        for x, y in val_loader:
-            logits = seg_model(pixel_values=x.to('cuda')).logits
-            logits = torch.nn.functional.interpolate(
-                logits, size=y.shape[-2:], mode='bilinear', align_corners=False)
-            pred = logits.argmax(1).cpu().numpy()
-            tgt = y.numpy()
-            for p_, t_ in zip(pred, tgt):
-                k = (t_ >= 0) & (t_ < NUM_SEG_CLASSES)
-                cm += np.bincount(NUM_SEG_CLASSES * t_[k] + p_[k],
-                                  minlength=NUM_SEG_CLASSES**2
-                                  ).reshape(NUM_SEG_CLASSES, NUM_SEG_CLASSES)
-    acc = float(np.diag(cm).sum() / max(cm.sum(), 1))
-    denom = cm.sum(1) + cm.sum(0) - np.diag(cm)
-    iou = np.diag(cm) / np.maximum(denom, 1)
-    present = cm.sum(1) > 0
-    miou = float(iou[present].mean() if present.any() else 0.0)
-    return acc, miou
-
-if start_epoch >= SEG_EPOCHS:
-    log.info(f'SegFormer already trained {start_epoch} epochs - skipping training.')
-else:
-    for epoch in range(start_epoch, SEG_EPOCHS):
-        seg_model.train()
-        t0, tot = time.time(), 0.0
-        for x, y in train_loader:
-            x, y = x.to('cuda'), y.to('cuda')
-            opt.zero_grad()
-            with torch.amp.autocast('cuda'):
-                out = seg_model(pixel_values=x, labels=y)
-            scaler.scale(out.loss).backward()
-            scaler.step(opt); scaler.update()
-            tot += out.loss.item()
-        msg = (f'epoch {epoch+1}/{SEG_EPOCHS}  loss={tot/len(train_loader):.4f}'
-               f'  {time.time()-t0:.0f}s')
-        torch.save({'epoch': epoch, 'model': seg_model.state_dict(),
-                    'opt': opt.state_dict(), 'best_miou': best_miou}, SEG_CKPT)
-        if (epoch + 1) % SEG_VAL_EVERY == 0 or (epoch + 1) == SEG_EPOCHS:
-            acc, miou = seg_evaluate()
-            msg += f'  pixAcc={acc:.4f}  mIoU={miou:.4f}'
-            if miou > best_miou:
-                best_miou = miou
-                torch.save({'epoch': epoch, 'model': seg_model.state_dict(),
-                            'best_miou': best_miou}, SEG_BEST)
-                msg += '  <-- best'
-        log.info(msg)
-    log.info(f'SegFormer training done. Best mIoU: {best_miou:.4f}')""")
-
-# ======================================================================
-# 8 - Evaluation / metrics export
-# ======================================================================
-md("## 8 - Evaluation/metrics export")
-
-code("""# 8.1 - SegFormer evaluation + visualisation
-import matplotlib.pyplot as plt
-if os.path.exists(SEG_BEST):
-    seg_model.load_state_dict(torch.load(SEG_BEST, map_location='cuda')['model'])
-seg_acc, seg_miou = seg_evaluate()
-log.info(f'SegFormer  pixel-accuracy={seg_acc:.4f}  mIoU={seg_miou:.4f}')
-
-seg_model.eval()
-n_show = min(3, len(seg_val))
-if n_show:
-    fig, axes = plt.subplots(n_show, 3, figsize=(13, 4*n_show))
-    if n_show == 1:
-        axes = np.array([axes])
-    step = max(1, len(seg_val) // (n_show + 1))
-    for row in range(n_show):
-        x, y = seg_val[row * step]
-        with torch.no_grad():
-            lo = seg_model(pixel_values=x.unsqueeze(0).to('cuda')).logits
-            lo = torch.nn.functional.interpolate(lo, size=y.shape[-2:],
-                                                 mode='bilinear', align_corners=False)
-            pr = lo.argmax(1)[0].cpu().numpy()
-        img = (x.permute(1, 2, 0).numpy() * WeakSegDataset.STD
-               + WeakSegDataset.MEAN).clip(0, 1)
-        axes[row,0].imshow(img);                                axes[row,0].set_title('image')
-        axes[row,1].imshow(y.numpy(), vmin=0, vmax=9, cmap='tab10'); axes[row,1].set_title('pseudo-mask (GT)')
-        axes[row,2].imshow(pr,         vmin=0, vmax=9, cmap='tab10'); axes[row,2].set_title('SegFormer prediction')
-        for c in range(3): axes[row,c].axis('off')
-    plt.tight_layout()
-    seg_viz = f'{RESULTS_DIR}/segformer_predictions.png'
-    plt.savefig(seg_viz, dpi=110, bbox_inches='tight'); plt.show()
-    log.info(f'Saved {seg_viz}')""")
-
-code("""# 8.2 - Consolidated metrics JSON (one file per model + an overall summary)
-seg_metrics = {
-    'backbone': SEG_BACKBONE, 'epochs_config': SEG_EPOCHS,
-    'imgsz': SEG_IMGSZ, 'batch': SEG_BATCH,
-    'pixel_accuracy': float(seg_acc),
-    'mIoU': float(seg_miou),
-    'best_mIoU': float(best_miou),
-}
-with open(f'{RESULTS_DIR}/segformer_metrics.json', 'w') as f:
-    json.dump(seg_metrics, f, indent=2)
 
 experiment_summary = {
-    'yolov12':   yolo_metrics,
-    'segformer': seg_metrics,
-    'dataset':   stats,
+    'yolov12': yolo_metrics,
+    'dataset_balance': balance_report,
     'verification': per_split,
 }
 with open(f'{RESULTS_DIR}/experiment_summary.json', 'w') as f:
     json.dump(experiment_summary, f, indent=2)
-log.info('=== EXPERIMENT SUMMARY ===\\n' + json.dumps(experiment_summary, indent=2))""")
+log.info('YOLOv12 metrics exported:\\n' + json.dumps(yolo_metrics, indent=2))""")
 
 # ======================================================================
-# 9 - Checkpoints/results saved to Drive
+# 11 - Drive artifacts
 # ======================================================================
-md("## 9 - Checkpoints/results saved to Drive")
+md("## 11 - Drive artifacts")
 
-code("""# 9.1 - Print the exact Drive locations of every produced artifact.
+code("""# 11.1 - Print the exact Drive locations of every produced artifact.
 print('=' * 78)
-print(' SkyLogic Sample-9k - Drive artifacts')
+print(' SkyLogic balanced-YOLOv12 - Drive artifacts')
 print('=' * 78)
 print()
-print('Sampled dataset:')
-print(f'  {DRIVE_SAMPLE_DIR}/')
-print(f'    images/{{train,val,test}}/')
-print(f'    labels/{{train,val,test}}/')
-print(f'    data.yaml, class_map.json, seg_class_map.json, dataset_stats.json')
+print('Balanced dataset (separate from the read-only original):')
+print(f'  {BALANCED_DIR}/')
+print(f'    images/{{train,val,test}}/   labels/{{train,val,test}}/')
+print(f'    data.yaml')
+print(f'    class_group_mapping.json')
+print(f'    dataset_balance_report.json')
+print(f'    dataset_balance_report.csv')
 print()
 print('YOLOv12 checkpoints:')
 print(f'  {YOLO_PROJECT_DIR}/{YOLO_RUN_NAME}/weights/best.pt')
-print(f'  {YOLO_PROJECT_DIR}/{YOLO_RUN_NAME}/weights/last.pt')
-print(f'  (+ epoch{{N}}.pt every {{save_period=5}} epochs)')
+print(f'  {YOLO_PROJECT_DIR}/{YOLO_RUN_NAME}/weights/last.pt  (+ epoch{{N}}.pt)')
 print()
-print('YOLOv12 metrics:')
-print(f'  {RESULTS_DIR}/yolov12_metrics.json')
-print(f'  {RESULTS_DIR}/yolov12_results.csv   (per-epoch losses + mAP)')
-print(f'  {RESULTS_DIR}/yolov12_predictions.png')
-print()
-print('SegFormer checkpoints:')
-print(f'  {SEG_DIR}/segformer_last.pt   (resumable, saved every epoch)')
-print(f'  {SEG_DIR}/segformer_best.pt   (best mIoU)')
-print()
-print('SegFormer metrics:')
-print(f'  {RESULTS_DIR}/segformer_metrics.json')
-print(f'  {RESULTS_DIR}/segformer_predictions.png')
-print()
-print('Other:')
-print(f'  {RESULTS_DIR}/experiment_summary.json')
+print('Reports + metrics:')
+print(f'  {RESULTS_DIR}/original_class_distribution.json')
+print(f'  {RESULTS_DIR}/class_group_mapping.json')
+print(f'  {RESULTS_DIR}/dataset_balance_report.json / .csv')
 print(f'  {RESULTS_DIR}/dataset_verification.json')
+print(f'  {RESULTS_DIR}/yolov12_metrics.json')
+print(f'  {RESULTS_DIR}/yolov12_results.csv')
+print(f'  {RESULTS_DIR}/yolov12_predictions.png')
+print(f'  {RESULTS_DIR}/experiment_summary.json')
 print(f'  {LOG_FILE}')
 print('=' * 78)
 log.info('Run finished.')""")
